@@ -1103,12 +1103,10 @@ function doGet(e) {
   if (!params.action) {
     return withCors_(jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } }));
   }
-  const headers = (e && e.headers) || {};
-  const token = String(params.token || headers['X-Auth-Token'] || headers['x-auth-token'] || '').trim();
   try {
     return withCors_(jsonResponse_({ ok: true, data: dispatchApi_({
       action: params.action,
-      token: token,
+      token: String(params.token || ''),
       args: params.args ? JSON.parse(params.args) : []
     }) }));
   } catch (error) {
@@ -1118,17 +1116,11 @@ function doGet(e) {
 
 function doPost(e) {
   try {
-    const headers = (e && e.headers) || {};
     const request = JSON.parse(e && e.postData && e.postData.contents || '{}');
-    request.token = String(request.token || headers['X-Auth-Token'] || headers['x-auth-token'] || '').trim();
     return withCors_(jsonResponse_({ ok: true, data: dispatchApi_(request) }));
   } catch (error) {
     return withCors_(jsonResponse_({ ok: false, error: String(error && error.message || error) }));
   }
-}
-
-function doOptions() {
-  return handlePreflight_();
 }
 
 function bootstrap() {
