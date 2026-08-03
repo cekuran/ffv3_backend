@@ -1073,17 +1073,14 @@ function jsonResponse_(payload) {
 
 function handlePreflight_() {
   return ContentService.createTextOutput('')
-    .setMimeType(ContentService.MimeType.TEXT)
-    .appendHeader('Access-Control-Allow-Origin', '*')
-    .appendHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    .appendHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token');
+    .setMimeType(ContentService.MimeType.TEXT);
 }
 
 function withCors_(output) {
   return output
-    .appendHeader('Access-Control-Allow-Origin', '*')
-    .appendHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    .appendHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token');
+    .setHeader('Access-Control-Allow-Origin', '*')
+    .setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    .setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token');
 }
 
 function dispatchApi_(request) {
