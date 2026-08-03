@@ -1443,17 +1443,14 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('is-show'), 2400);
 }
 
-const API_URL = 'https://script.google.com/macros/s/AKfycbzXkrHv1jAcWapieFq0GqL5CdSTucAZxZVPijJ1xlQHCWLyG34BDufgVLctX3gCIBsP/exec';
+const API_URL = 'https://script.google.com/macros/s/AKfycbz-R78T5EX4_ZDqfThjNeF6EyZfr-YNn57iIy2cAi_3BuE3DPl_bjcgwi-tyCPn9xM/exec';
 
 async function rawCall(fn, ...args) {
-  const isPublic = fn === 'loginUsuario' || fn === 'authStatus' || fn === 'logoutUsuario';
-  const headers = { 'Content-Type': 'text/plain;charset=utf-8' };
+  const isPublic = fn === 'loginUsuario' || fn === 'authStatus' || fn === 'logoutUsuario' || fn === 'ping' || fn === 'configurarSpreadsheetMaestro';
+  const url = API_URL + '?action=' + encodeURIComponent(fn) + '&args=' + encodeURIComponent(JSON.stringify(args));
+  const headers = {};
   if (!isPublic) headers['X-Auth-Token'] = localStorage.getItem(AUTH_TOKEN_KEY) || '';
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ action: fn, args })
-  });
+  const response = await fetch(url, { method: 'GET', headers });
   const payload = await response.json();
   if (!payload.ok) throw new Error(payload.error || 'Error de API');
   return payload.data;
