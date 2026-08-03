@@ -1047,7 +1047,7 @@ const API_ACTIONS = new Set([
   'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion',
   'obtenerRecurrentes', 'guardarRecurrente', 'eliminarRecurrente', 'generarRecurrentesPendientes',
   'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar',
-  'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'ejecutarSelfTestAdmin'
+  'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'ejecutarSelfTestAdmin', 'ping', 'configurarSpreadsheetMaestro'
 ]);
 
 function ping() {
@@ -1067,7 +1067,23 @@ function configurarSpreadsheetMaestro(id) {
 const API_PUBLIC_ACTIONS = new Set(['authStatus', 'loginUsuario', 'logoutUsuario', 'ping', 'configurarSpreadsheetMaestro']);
 
 function jsonResponse_(payload) {
-  return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function handlePreflight_() {
+  return ContentService.createTextOutput('')
+    .setMimeType(ContentService.MimeType.TEXT)
+    .appendHeader('Access-Control-Allow-Origin', '*')
+    .appendHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    .appendHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token');
+}
+
+function withCors_(output) {
+  return output
+    .appendHeader('Access-Control-Allow-Origin', '*')
+    .appendHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    .appendHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token');
 }
 
 function dispatchApi_(request) {
@@ -1091,13 +1107,13 @@ function doGet(e) {
     return jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } });
   }
   try {
-    return jsonResponse_({ ok: true, data: dispatchApi_({
+    return withCors_(jsonResponse_({ ok: true, data: dispatchApi_({
       action: params.action,
       token: params.token || '',
       args: params.args ? JSON.parse(params.args) : []
-    }) });
+    }) }));
   } catch (error) {
-    return jsonResponse_({ ok: false, error: String(error && error.message || error) });
+    return withCors_(jsonResponse_({ ok: false, error: String(error && error.message || error) }));
   }
 }
 
@@ -1106,10 +1122,14 @@ function doPost(e) {
     const headers = (e && e.headers) || {};
     const request = JSON.parse(e && e.postData && e.postData.contents || '{}');
     request.token = String(request.token || headers['X-Auth-Token'] || headers['x-auth-token'] || '').trim();
-    return jsonResponse_({ ok: true, data: dispatchApi_(request) });
+    return withCors_(jsonResponse_({ ok: true, data: dispatchApi_(request) }));
   } catch (error) {
-    return jsonResponse_({ ok: false, error: String(error && error.message || error) });
+    return withCors_(jsonResponse_({ ok: false, error: String(error && error.message || error) }));
   }
+}
+
+function doOptions() {
+  return handlePreflight_();
 }
 
 function bootstrap() {

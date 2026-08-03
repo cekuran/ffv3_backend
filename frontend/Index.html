@@ -1443,7 +1443,7 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('is-show'), 2400);
 }
 
-const API_URL = 'PEGA_AQUI_LA_URL_EXEC_DE_APPS_SCRIPT';
+const API_URL = 'https://script.google.com/macros/s/AKfycbzXkrHv1jAcWapieFq0GqL5CdSTucAZxZVPijJ1xlQHCWLyG34BDufgVLctX3gCIBsP/exec';
 
 async function rawCall(fn, ...args) {
   const isPublic = fn === 'loginUsuario' || fn === 'authStatus' || fn === 'logoutUsuario';
@@ -1497,8 +1497,8 @@ function mostrarApp() {
 }
 
 async function initApp() {
-  if (!API_URL || API_URL === 'https://script.google.com/macros/s/AKfycbyJN4YcEHcHstAkz3duPlYnAV0v9epIrSAZGPphzKQ/dev') {
-    mostrarSetupSheet();
+  if (!API_URL) {
+    mostrarSetupApi();
     return;
   }
   try {
@@ -4300,7 +4300,7 @@ window.addEventListener('hashchange', () => {
 
 (async function init() {
   try {
-    if (!API_URL || API_URL === 'https://script.google.com/macros/s/AKfycbyJN4YcEHcHstAkz3duPlYnAV0v9epIrSAZGPphzKQ/dev') {
+    if (!API_URL) {
       mostrarSetupApi();
       return;
     }
