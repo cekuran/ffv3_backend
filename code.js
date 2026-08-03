@@ -49,11 +49,14 @@ const SEMILLA = {
 };
 
 // ───────── Helpers de sesión y ss ─────────
-// Configura una vez el ID de la hoja maestra antes de desplegar.
-const MASTER_SPREADSHEET_ID = 'PEGA_AQUI_EL_ID_DEL_GOOGLE_SHEET';
+const MASTER_PROP_KEY = 'MASTER_SPREADSHEET_ID';
 const DEFAULT_ADMIN_PASSWORD = 'admin1234';
 const APP_VERSION = 'ms-http-1';
 const CONFIG_DATA_SHEET_ID = 'SHEET_ID_PRODUCTION';
+
+function getMasterSpreadsheetId_() {
+  return PropertiesService.getScriptProperties().getProperty(MASTER_PROP_KEY) || '';
+}
 
 // Token cacheado durante una única petición HTTP; la persistencia vive en Tokens.
 let _currentToken = '';
@@ -356,12 +359,12 @@ function guardarSheetIdParaEntorno_(sheetId) {
 }
 
 function obtenerAuthSheetIdConfigurado_() {
-  return MASTER_SPREADSHEET_ID;
+  return getMasterSpreadsheetId_();
 }
 
 function guardarAuthSheetIdParaEntorno_(sheetId) {
   const id = String(sheetId || '').trim();
-  if (id !== MASTER_SPREADSHEET_ID) throw new Error('El ID maestro se configura en MASTER_SPREADSHEET_ID');
+  PropertiesService.getScriptProperties().setProperty(MASTER_PROP_KEY, id);
   return id;
 }
 
@@ -391,10 +394,9 @@ function ssActiva_() {
 }
 
 function authSs_() {
-  if (!MASTER_SPREADSHEET_ID || MASTER_SPREADSHEET_ID === 'PEGA_AQUI_EL_ID_DEL_GOOGLE_SHEET') {
-    throw new Error('Configura MASTER_SPREADSHEET_ID en code.js');
-  }
-  return SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const id = getMasterSpreadsheetId_();
+  if (!id) throw new Error('Configura MASTER_SPREADSHEET_ID en Script Properties');
+  return SpreadsheetApp.openById(id);
 }
 
 function asegurarAuthHojaUsuarios_() {
