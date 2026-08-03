@@ -1443,16 +1443,16 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('is-show'), 2400);
 }
 
-const API_URL = '<?= ScriptApp.getService().getUrl() ?>';
+const API_URL = 'PEGA_AQUI_LA_URL_EXEC_DE_APPS_SCRIPT';
 
 async function rawCall(fn, ...args) {
+  const isPublic = fn === 'loginUsuario' || fn === 'authStatus' || fn === 'logoutUsuario';
+  const headers = { 'Content-Type': 'text/plain;charset=utf-8' };
+  if (!isPublic) headers['X-Auth-Token'] = localStorage.getItem(AUTH_TOKEN_KEY) || '';
   const response = await fetch(API_URL, {
     method: 'POST',
-    body: JSON.stringify({
-      action: fn,
-      args,
-      token: localStorage.getItem(AUTH_TOKEN_KEY) || ''
-    })
+    headers,
+    body: JSON.stringify({ action: fn, args })
   });
   const payload = await response.json();
   if (!payload.ok) throw new Error(payload.error || 'Error de API');

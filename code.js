@@ -1071,12 +1071,7 @@ function __selfTestApi_() {
 function doGet(e) {
   const params = (e && e.parameter) || {};
   if (!params.action) {
-    migrarEsquema();
-    asegurarUsuarios_();
-    return HtmlService.createTemplateFromFile('Index').evaluate()
-      .setTitle('Finanzas Familia')
-      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
-      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+    return jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } });
   }
   try {
     return jsonResponse_({ ok: true, data: dispatchApi_({
@@ -1091,7 +1086,9 @@ function doGet(e) {
 
 function doPost(e) {
   try {
+    const headers = (e && e.headers) || {};
     const request = JSON.parse(e && e.postData && e.postData.contents || '{}');
+    request.token = String(request.token || headers['X-Auth-Token'] || headers['x-auth-token'] || '').trim();
     return jsonResponse_({ ok: true, data: dispatchApi_(request) });
   } catch (error) {
     return jsonResponse_({ ok: false, error: String(error && error.message || error) });
