@@ -1496,6 +1496,50 @@ function mostrarApp() {
   showAuthError('');
 }
 
+async function initApp() {
+  if (!API_URL || API_URL === 'PEGA_AQUI_LA_URL_EXEC_DE_APPS_SCRIPT') {
+    mostrarSetupSheet();
+    return;
+  }
+  try {
+    await rawCall('ping');
+  } catch (e) {
+    if (typeof e.message === 'string' && e.message.startsWith('NO_MASTER_SPREADSHEET')) {
+      mostrarSetupSheet();
+      return;
+    }
+  }
+  mostrarLogin();
+}
+
+function mostrarSetupSheet() {
+  $('#setupScreen').style.display = 'grid';
+  $('#authScreen').style.display = 'none';
+  $('.app').style.display = 'none';
+}
+
+function mostrarSetupApi() {
+  document.body.innerHTML = '<div class="auth-screen"><form class="auth-card" onsubmit="return false"><h2>Falta API_URL</h2><p>Edita este HTML y define <code>const API_URL</code> con la URL de tu Web App de Apps Script.</p></form></div>';
+}
+
+function mostrarSetupSheet() {
+  document.body.innerHTML = '<div class="auth-screen"><form id="setupForm" class="auth-card"><h2>Configura el spreadsheet maestro</h2><p class="muted">Pega aquí el ID del Google Sheet donde vivirá la base de datos y los usuarios.</p><label>Spreadsheet ID<input id="setupSheetId" required pattern="[A-Za-z0-9_-]{20,}" placeholder="1B7IYG8T..." /></label><div id="setupError" class="auth-error"></div><button type="submit" id="setupSubmit">Guardar</button></form></div>';
+  const form = document.getElementById('setupForm');
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const id = document.getElementById('setupSheetId').value.trim();
+    if (!id) return;
+    document.getElementById('setupSubmit').disabled = true;
+    try {
+      await rawCall('configurarSpreadsheetMaestro', id);
+      location.reload();
+    } catch (err) {
+      document.getElementById('setupError').textContent = err.message || 'Error al guardar';
+      document.getElementById('setupSubmit').disabled = false;
+    }
+  });
+}
+
 async function cargarUsuariosAdminUI() {
   const listEl = $('#adminUsersList');
   if (!listEl) return;
@@ -4256,6 +4300,24 @@ window.addEventListener('hashchange', () => {
 
 (async function init() {
   try {
+    if (!API_URL || API_URL === 'PEGA_AQUI_LA_URL_EXEC_DE_APPS_SCRIPT') {
+      mostrarSetupApi();
+      return;
+    }
+    try {
+      const ping = await rawCall('ping');
+      if (ping && ping.configurado === false) {
+        mostrarSetupSheet();
+        return;
+      }
+    } catch (e) {
+      if (typeof e.message === 'string' && e.message.startsWith('NO_MASTER_SPREADSHEET')) {
+        mostrarSetupSheet();
+        return;
+      }
+      throw e;
+    }
+
     const token = localStorage.getItem(AUTH_TOKEN_KEY) || '';
     const sesionExpirada = !!localStorage.getItem(AUTH_IS_LOGGED_KEY);
 

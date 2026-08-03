@@ -1049,7 +1049,22 @@ const API_ACTIONS = new Set([
   'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar',
   'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'ejecutarSelfTestAdmin'
 ]);
-const API_PUBLIC_ACTIONS = new Set(['authStatus', 'loginUsuario', 'logoutUsuario']);
+
+function ping() {
+  if (!getMasterSpreadsheetId_()) {
+    return { ok: true, configurado: false };
+  }
+  return { ok: true, configurado: true, version: APP_VERSION };
+}
+
+function configurarSpreadsheetMaestro(id) {
+  const limpio = String(id || '').trim();
+  if (!/^[A-Za-z0-9_-]{20,}$/.test(limpio)) throw new Error('ID de spreadsheet inválido');
+  SpreadsheetApp.openById(limpio);
+  guardarAuthSheetIdParaEntorno_(limpio);
+  return { ok: true, configurado: true };
+}
+const API_PUBLIC_ACTIONS = new Set(['authStatus', 'loginUsuario', 'logoutUsuario', 'ping', 'configurarSpreadsheetMaestro']);
 
 function jsonResponse_(payload) {
   return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
