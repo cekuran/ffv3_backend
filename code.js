@@ -1104,12 +1104,14 @@ function __selfTestApi_() {
 function doGet(e) {
   const params = (e && e.parameter) || {};
   if (!params.action) {
-    return jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } });
+    return withCors_(jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } }));
   }
+  const headers = (e && e.headers) || {};
+  const token = String(params.token || headers['X-Auth-Token'] || headers['x-auth-token'] || '').trim();
   try {
     return withCors_(jsonResponse_({ ok: true, data: dispatchApi_({
       action: params.action,
-      token: params.token || '',
+      token: token,
       args: params.args ? JSON.parse(params.args) : []
     }) }));
   } catch (error) {
