@@ -1443,15 +1443,23 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('is-show'), 2400);
 }
 
-const API_URL = 'https://script.google.com/macros/s/AKfycbzZh4zIUzogoEsuPG_Nh-gT4RPxrU7KdMzSc3V2HeXkG4IOrbHwHfDOflgEOng0Mq5v/exec';
+const API_URL = 'https://script.google.com/macros/s/AKfycbxwi48jdcLMC3MDxw799oPNCEbBbZvHX8VJV0ud7MVsLp5QENTih2oXUfynhZ0ZyVM/exec';
 
 async function rawCall(fn, ...args) {
   const body = JSON.stringify({ action: fn, args, token: localStorage.getItem(AUTH_TOKEN_KEY) || '' });
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: body
-  });
+  let response;
+  try {
+    response = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: body
+    });
+  } catch (err) {
+    if (window.location.protocol === 'file:') {
+      throw new Error('Estas abriendo la app con file:// (origen null). Sirvela por http://localhost para evitar bloqueo del navegador.');
+    }
+    throw new Error('No se pudo conectar con la API (posible CORS, URL incorrecta o deploy sin publicar).');
+  }
   const text = await response.text();
   let payload;
   try {
@@ -4308,6 +4316,10 @@ window.addEventListener('hashchange', () => {
 
 (async function init() {
   try {
+    if (window.location.protocol === 'file:') {
+      document.body.innerHTML = '<div class="auth-screen"><form class="auth-card" onsubmit="return false"><h2>Origen no soportado (file://)</h2><p>Abre esta app desde <code>http://localhost</code> (por ejemplo con un servidor local) para evitar bloqueos CORS del navegador.</p></form></div>';
+      return;
+    }
     if (!API_URL) {
       mostrarSetupApi();
       return;

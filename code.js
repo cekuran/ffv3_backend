@@ -1071,18 +1071,6 @@ function jsonResponse_(payload) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-function handlePreflight_() {
-  return ContentService.createTextOutput('')
-    .setMimeType(ContentService.MimeType.TEXT);
-}
-
-function withCors_(output) {
-  return output
-    .setHeader('Access-Control-Allow-Origin', '*')
-    .setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    .setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token');
-}
-
 function dispatchApi_(request) {
   const action = String(request.action || '').trim();
   const args = Array.isArray(request.args) ? request.args : [];
@@ -1101,25 +1089,25 @@ function __selfTestApi_() {
 function doGet(e) {
   const params = (e && e.parameter) || {};
   if (!params.action) {
-    return withCors_(jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } }));
+    return jsonResponse_({ ok: true, data: { service: 'finanzas-familia-api', version: APP_VERSION } });
   }
   try {
-    return withCors_(jsonResponse_({ ok: true, data: dispatchApi_({
+    return jsonResponse_({ ok: true, data: dispatchApi_({
       action: params.action,
       token: String(params.token || ''),
       args: params.args ? JSON.parse(params.args) : []
-    }) }));
+    }) });
   } catch (error) {
-    return withCors_(jsonResponse_({ ok: false, error: String(error && error.message || error) }));
+    return jsonResponse_({ ok: false, error: String(error && error.message || error) });
   }
 }
 
 function doPost(e) {
   try {
     const request = JSON.parse(e && e.postData && e.postData.contents || '{}');
-    return withCors_(jsonResponse_({ ok: true, data: dispatchApi_(request) }));
+    return jsonResponse_({ ok: true, data: dispatchApi_(request) });
   } catch (error) {
-    return withCors_(jsonResponse_({ ok: false, error: String(error && error.message || error) }));
+    return jsonResponse_({ ok: false, error: String(error && error.message || error) });
   }
 }
 
