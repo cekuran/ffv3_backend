@@ -522,8 +522,6 @@ function escribirHojasUsuarios_(filas) { escribirAuthHojaGenerica_('HojasUsuario
 // Resuelve la hoja activa del usuario actual con la siguiente prioridad:
 // 1) Hoja por defecto explícita en HojasUsuarios
 // 2) Primera hoja vinculada
-// 3) Hoja por defecto global legacy — auto-vinculada al usuario
-//    si no tiene otras
 function resolverHojaActivaId_(username) {
   username = String(username || '').trim();
   if (!username) return '';
@@ -531,12 +529,6 @@ function resolverHojaActivaId_(username) {
   const defecto = links.find(l => String(l.por_defecto) === 'true' || String(l.por_defecto) === true);
   if (defecto) return String(defecto.spreadsheet_id);
   if (links.length) return String(links[0].spreadsheet_id);
-  // Auto-vincular al sheet por defecto global (migración suave).
-  const envId = obtenerSheetIdConfigurado_();
-  if (envId) {
-    vincularHojaUsuarioInternal_(username, envId, true);
-    return envId;
-  }
   return '';
 }
 
@@ -1113,6 +1105,10 @@ function doPost(e) {
 
 function bootstrap() {
   const base = bootstrapBase();
+  if (!((base.hojas || []).length) || !base.hojaActivaId) {
+    base.transacciones = [];
+    return base;
+  }
   base.transacciones = obtenerTransacciones({});
   return base;
 }
@@ -1121,8 +1117,29 @@ function bootstrap() {
 // Devuelve todo menos transacciones para que la UI pinte antes.
 function bootstrapBase() {
   const owner = username_();
-  migrarEsquema();
   asegurarUsuarios_();
+  const hojasUsuario = listarHojasDelUsuario_(owner);
+  const hojaActivaId = _currentSheetId || resolverHojaActivaId_(owner);
+
+  if (!hojasUsuario.length || !hojaActivaId) {
+    _currentSheetId = '';
+    return {
+      sesion: { user: owner, rol: currentRol_() || ROLES.BASICO },
+      version: APP_VERSION,
+      hojas: [],
+      hojaActivaId: '',
+      cuentas: [],
+      categorias: [],
+      establecimientos: [],
+      recurrentes: [],
+      presupuestos: [],
+      resumen: null,
+      sin_datos_financieros: true
+    };
+  }
+
+  _currentSheetId = hojaActivaId;
+  migrarEsquema();
   let owners = listarOwnersConDatos_();
   if (!owners.length) {
     sembrar(owner);
@@ -1136,8 +1153,8 @@ function bootstrapBase() {
   return {
     sesion: { user: owner, rol: currentRol_() || ROLES.BASICO },
     version: APP_VERSION,
-    hojas: listarHojasDelUsuario_(owner),
-    hojaActivaId: _currentSheetId || resolverHojaActivaId_(owner),
+    hojas: hojasUsuario,
+    hojaActivaId: hojaActivaId,
     cuentas: obtenerCuentas(),
     categorias: obtenerCategorias(),
     establecimientos: obtenerEstablecimientos(),
