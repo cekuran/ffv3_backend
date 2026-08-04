@@ -97,13 +97,36 @@ function requireAdmin_() {
 // Despacho autenticado: valida el token guardado en Sheets, lo cachea
 // en _currentToken y ejecuta la función pedida. Sustituye al patrón
 // setAuthToken + fn en dos invocaciones (la caché no sobrevive entre
-// invocaciones HTTP separadas).
+// Endpoints que siguen disponibles aunque el usuario no tenga hojas
+// vinculadas (no son admin). El resto devuelven error para no filtrar
+// datos del spreadsheet de producción.
+const ALWAYS_ALLOWED_FOR_NO_HOJAS = new Set([
+  'bootstrap', 'bootstrapBase', 'authStatus', 'loginUsuario', 'logoutUsuario',
+  'ping', 'configurarSpreadsheetMaestro', 'cambiarMiContrasena',
+  'listarMisHojas', 'cambiarHojaActiva'
+]);
+
+function usuarioTieneHojas_(username) {
+  if (!username) return false;
+  return leerHojasUsuarios_().some(l =>
+    String(l.username || '').trim().toLowerCase() === String(username || '').trim().toLowerCase()
+  );
+}
+
 function _authadmin(token, fnName, ...args) {
   const username = validarTokenSesion_(token);
   if (!username) throw new Error('No autenticado');
   _currentToken = String(token || '').trim();
   try { _currentSheetId = resolverHojaActivaId_(username); }
   catch (e) { _currentSheetId = ''; }
+  // Guard: si el usuario (no admin) no tiene hojas, sólo se permite un
+  // conjunto mínimo de acciones. Cualquier endpoint de datos falla rápido
+  // para impedir lecturas filtradas del spreadsheet de producción.
+  const usuario = buscarUsuario_(username);
+  const rol = usuario ? String(usuario.rol || ROLES.BASICO) : ROLES.BASICO;
+  if (rol !== ROLES.ADMIN && !usuarioTieneHojas_(username) && !ALWAYS_ALLOWED_FOR_NO_HOJAS.has(fnName)) {
+    throw new Error('No tienes hojas de cálculo asignadas. Pide al administrador que vincule una hoja.');
+  }
   const fn = globalThis[fnName];
   if (typeof fn !== 'function') throw new Error('Función no encontrada: ' + fnName);
   return fn.apply(null, args);
