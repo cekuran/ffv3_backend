@@ -1123,6 +1123,12 @@ function bootstrapBase() {
 
   if (!hojasUsuario.length || !hojaActivaId) {
     _currentSheetId = '';
+    // Contrato: cuando el usuario autenticado no tiene ninguna hoja vinculada,
+    // el bootstrap devuelve estado vacío y dos flags explícitos:
+    //   - sin_hojas: true → no hay hojas asignadas a este usuario.
+    //   - sin_datos_financieros: true → no hay datos que mostrar.
+    // El frontend usa esto para NO mostrar ninguna vista de datos al usuario
+    // (excepto la vista admin cuando el rol lo permite).
     return {
       sesion: { user: owner, rol: currentRol_() || ROLES.BASICO },
       version: APP_VERSION,
@@ -1134,6 +1140,7 @@ function bootstrapBase() {
       recurrentes: [],
       presupuestos: [],
       resumen: null,
+      sin_hojas: true,
       sin_datos_financieros: true
     };
   }
