@@ -1,2 +1,5 @@
 .claude
 .clasp.json
+
+# Local Netlify folder
+.netlify
