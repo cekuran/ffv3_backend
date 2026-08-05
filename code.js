@@ -58,6 +58,108 @@ function getMasterSpreadsheetId_() {
   return PropertiesService.getScriptProperties().getProperty(MASTER_PROP_KEY) || '';
 }
 
+// ───────── Script Cache (CacheService) ─────────
+// Caché compartida entre ejecuciones del Web App. Reduce lecturas al spreadsheet
+// maestro (Tokens, Usuarios, HojasUsuarios, Spreadsheets, Config) en el path
+// caliente de cada request autenticada.
+// Límites GAS: ~100 KB/entrada, TTL máx. 21600 s. Fallos de caché se ignoran.
+const CACHE_TTL_TOKEN_SEC = 30 * 60;       // 30 min — validación de sesión
+const CACHE_TTL_AUTH_SHEET_SEC = 5 * 60;   // 5 min — hojas del spreadsheet maestro
+const CACHE_TTL_SALDOS_SEC = 10 * 60;      // 10 min — saldos/evolución de cuentas
+const CACHE_MAX_JSON_CHARS = 90000;        // margen bajo el límite ~100 KB
+
+function scriptCache_() {
+  return CacheService.getScriptCache();
+}
+
+// Prefijos del valor almacenado en CacheService:
+//   z:  JSON gzip + base64 (preferido si reduce tamaño)
+//   r:  JSON crudo
+//   (sin prefijo) JSON legacy de versiones anteriores
+const CACHE_PREFIX_GZIP = 'z:';
+const CACHE_PREFIX_RAW = 'r:';
+
+function cacheSerialize_(value) {
+  const json = JSON.stringify(value);
+  if (!json) return '';
+  // Gzip solo compensa a partir de un tamaño mínimo (overhead base64 ~33%).
+  if (json.length >= 400) {
+    try {
+      const gzBlob = Utilities.gzip(Utilities.newBlob(json, 'application/json'));
+      const b64 = Utilities.base64Encode(gzBlob.getBytes());
+      if (b64 && b64.length + 2 < json.length + 2) {
+        return CACHE_PREFIX_GZIP + b64;
+      }
+    } catch (e) {
+      /* fallback a raw */
+    }
+  }
+  return CACHE_PREFIX_RAW + json;
+}
+
+function cacheDeserialize_(raw) {
+  if (!raw) return null;
+  if (raw.indexOf(CACHE_PREFIX_GZIP) === 0) {
+    const bytes = Utilities.base64Decode(raw.substring(CACHE_PREFIX_GZIP.length));
+    const plain = Utilities.ungzip(Utilities.newBlob(bytes)).getDataAsString();
+    return JSON.parse(plain);
+  }
+  if (raw.indexOf(CACHE_PREFIX_RAW) === 0) {
+    return JSON.parse(raw.substring(CACHE_PREFIX_RAW.length));
+  }
+  // Compatibilidad con entradas previas (JSON sin prefijo).
+  return JSON.parse(raw);
+}
+
+function cacheGetJson_(key) {
+  try {
+    const raw = scriptCache_().get(key);
+    if (!raw) return null;
+    return cacheDeserialize_(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function cachePutJson_(key, value, ttlSec) {
+  try {
+    const s = cacheSerialize_(value);
+    if (!s || s.length > CACHE_MAX_JSON_CHARS) return false;
+    scriptCache_().put(key, s, Math.min(ttlSec || CACHE_TTL_AUTH_SHEET_SEC, 21600));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function cacheRemove_(key) {
+  try { scriptCache_().remove(key); } catch (e) { /* ignore */ }
+}
+
+function cacheRemoveAll_(keys) {
+  if (!keys || !keys.length) return;
+  try { scriptCache_().removeAll(keys); } catch (e) { /* ignore */ }
+}
+
+function tokenCacheKey_(token) {
+  return 'tok:' + String(token || '').trim();
+}
+
+function authSheetCacheKey_(nombre) {
+  return 'auth:' + String(nombre || '');
+}
+
+// Caché en memoria solo para la request actual (evita N hits a CacheService
+// o al sheet cuando bootstrap / _authadmin leen varias veces la misma hoja).
+const _authReadCache = {};
+
+function invalidateAuthSheetCache_(nombre) {
+  if (nombre) {
+    delete _authReadCache[nombre];
+    cacheRemove_(authSheetCacheKey_(nombre));
+  }
+}
+
 // Token cacheado durante una única petición HTTP; la persistencia vive en Tokens.
 let _currentToken = '';
 // Hoja activa resuelta por _authadmin a partir de HojasUsuarios; las funciones
@@ -152,22 +254,34 @@ function passwordHash_(password, salt) {
 
 function crearTokenSesion_(username) {
   const token = Utilities.getUuid();
+  const usernameNorm = String(username || '').trim();
   const filas = leerAuthHojaGenerica_('Tokens');
-  filas.push({ token: token, username: String(username || '').trim(), fecha_creacion: isoAhora_() });
+  filas.push({ token: token, username: usernameNorm, fecha_creacion: isoAhora_() });
   escribirAuthHojaGenerica_('Tokens', filas);
+  // Poblar caché de token de inmediato para la siguiente request.
+  if (usernameNorm) cachePutJson_(tokenCacheKey_(token), { u: usernameNorm }, CACHE_TTL_TOKEN_SEC);
   return token;
 }
 
 function validarTokenSesion_(token) {
   const t = String(token || '').trim();
   if (!t) return '';
+  // 1) Caché Script: evita abrir el master spreadsheet en casi todas las requests.
+  const hit = cacheGetJson_(tokenCacheKey_(t));
+  if (hit && hit.u) return String(hit.u);
+  // 2) Fallback a hoja Tokens (con caché de hoja + memoria de request).
   const fila = leerAuthHojaGenerica_('Tokens').find(r => String(r.token || '') === t);
-  return fila ? String(fila.username || '').trim() : '';
+  const username = fila ? String(fila.username || '').trim() : '';
+  if (username) cachePutJson_(tokenCacheKey_(t), { u: username }, CACHE_TTL_TOKEN_SEC);
+  return username;
 }
 
 function invalidarTokenSesion_(token) {
   const t = String(token || '').trim();
   if (!t) return;
+  // Invalidar antes de escribir para que un request concurrente no rehidrate
+  // un token ya revocado desde la hoja vieja en caché.
+  cacheRemove_(tokenCacheKey_(t));
   escribirAuthHojaGenerica_('Tokens', leerAuthHojaGenerica_('Tokens').filter(r => String(r.token || '') !== t));
 }
 
@@ -442,15 +556,30 @@ function asegurarAuthHojaUsuarios_() {
 }
 
 function leerUsuariosAuth_() {
+  const cacheName = 'Usuarios';
+  if (_authReadCache[cacheName]) return cloneRows_(_authReadCache[cacheName]);
+  const cached = cacheGetJson_(authSheetCacheKey_(cacheName));
+  if (cached) {
+    const rows = cached.map(normalizarUsuarioAuth_);
+    _authReadCache[cacheName] = rows;
+    return cloneRows_(rows);
+  }
   const h = asegurarAuthHojaUsuarios_();
   const valores = h.getDataRange().getValues();
-  if (valores.length < 2) return [];
+  if (valores.length < 2) {
+    _authReadCache[cacheName] = [];
+    cachePutJson_(authSheetCacheKey_(cacheName), [], CACHE_TTL_AUTH_SHEET_SEC);
+    return [];
+  }
   const cab = valores[0];
-  return valores.slice(1).map(fila => {
+  const rows = valores.slice(1).map(fila => {
     const o = {};
     cab.forEach((k, i) => (o[k] = fila[i]));
     return normalizarUsuarioAuth_(o);
   });
+  _authReadCache[cacheName] = rows;
+  cachePutJson_(authSheetCacheKey_(cacheName), rows, CACHE_TTL_AUTH_SHEET_SEC);
+  return cloneRows_(rows);
 }
 
 function normalizarUsuarioAuth_(u) {
@@ -466,12 +595,12 @@ function escribirUsuariosAuth_(filas) {
   const h = asegurarAuthHojaUsuarios_();
   const cab = AUTH_SCHEMA.Usuarios;
   h.clearContents();
-  const matriz = [cab].concat(filas.map(f => {
-    const u = normalizarUsuarioAuth_(Object.assign({}, f));
-    return cab.map(k => u[k] != null ? u[k] : '');
-  }));
+  const normalizadas = (filas || []).map(f => normalizarUsuarioAuth_(Object.assign({}, f)));
+  const matriz = [cab].concat(normalizadas.map(u => cab.map(k => u[k] != null ? u[k] : '')));
   if (matriz.length) h.getRange(1, 1, matriz.length, cab.length).setValues(matriz);
   h.setFrozenRows(1);
+  _authReadCache['Usuarios'] = cloneRows_(normalizadas);
+  cachePutJson_(authSheetCacheKey_('Usuarios'), normalizadas, CACHE_TTL_AUTH_SHEET_SEC);
 }
 
 function leerUsuariosLegacyData_() {
@@ -517,24 +646,41 @@ function asegurarAuthHojaGenerica_(nombre) {
 }
 
 function leerAuthHojaGenerica_(nombre) {
+  if (_authReadCache[nombre]) return cloneRows_(_authReadCache[nombre]);
+  const cached = cacheGetJson_(authSheetCacheKey_(nombre));
+  if (cached) {
+    _authReadCache[nombre] = cached;
+    return cloneRows_(cached);
+  }
   const h = asegurarAuthHojaGenerica_(nombre);
   const valores = h.getDataRange().getValues();
-  if (valores.length < 2) return [];
+  if (valores.length < 2) {
+    _authReadCache[nombre] = [];
+    cachePutJson_(authSheetCacheKey_(nombre), [], CACHE_TTL_AUTH_SHEET_SEC);
+    return [];
+  }
   const cab = valores[0];
-  return valores.slice(1).map(fila => {
+  const rows = valores.slice(1).map(fila => {
     const o = {};
     cab.forEach((k, i) => (o[k] = fila[i]));
     return o;
   });
+  _authReadCache[nombre] = rows;
+  cachePutJson_(authSheetCacheKey_(nombre), rows, CACHE_TTL_AUTH_SHEET_SEC);
+  return cloneRows_(rows);
 }
 
 function escribirAuthHojaGenerica_(nombre, filas) {
   const h = asegurarAuthHojaGenerica_(nombre);
   const cab = AUTH_SCHEMA[nombre];
   h.clearContents();
-  const matriz = [cab].concat(filas.map(f => cab.map(k => f[k] != null ? f[k] : '')));
+  const filasSafe = filas || [];
+  const matriz = [cab].concat(filasSafe.map(f => cab.map(k => f[k] != null ? f[k] : '')));
   if (matriz.length) h.getRange(1, 1, matriz.length, cab.length).setValues(matriz);
   h.setFrozenRows(1);
+  // Mantener caché coherente tras la escritura (request + Script Cache).
+  _authReadCache[nombre] = cloneRows_(filasSafe);
+  cachePutJson_(authSheetCacheKey_(nombre), filasSafe, CACHE_TTL_AUTH_SHEET_SEC);
 }
 
 function leerSpreadsheets_() { return leerAuthHojaGenerica_('Spreadsheets'); }
@@ -975,6 +1121,180 @@ function invalidateSheetCache_(nombre) {
   if (nombre) delete _sheetReadCache[nombre];
 }
 
+// ───────── Caché de saldos de cuentas ─────────
+// obtenerCuentas() recorre todas las transacciones para calcular saldo y
+// evolución mensual. El resultado se cachea por spreadsheet activo:
+//   1) memoria de la request (_cuentasComputedCache)
+//   2) CacheService (saldos:<sheetId>) entre requests
+// Se invalida al escribir Cuentas o Transacciones (vía escribirHoja).
+let _cuentasComputedCache = null;
+let _cuentasComputedSheetId = '';
+
+function sheetIdParaCache_() {
+  return String(_currentSheetId || obtenerSheetIdConfigurado_() || 'default');
+}
+
+// Generación de datos por spreadsheet: se incrementa al escribir Cuentas o
+// Transacciones. Vive en la propia hoja de datos (pestaña `_meta`),
+// no en Script Properties. La clave de Script Cache incluye la generación
+// para no reutilizar saldos anteriores a la última mutación.
+const META_SHEET_NAME = '_meta';
+const META_DATA_VERSION_KEY = 'data_version';
+// Caché en memoria de la request: evita releer `_meta` en cada obtenerCuentas.
+const _dataVersionMem = {};
+
+function asegurarMetaHoja_() {
+  const ss = ssActiva_();
+  let h = ss.getSheetByName(META_SHEET_NAME);
+  if (!h) {
+    h = ss.insertSheet(META_SHEET_NAME);
+    h.getRange(1, 1, 1, 2).setValues([['clave', 'valor']]).setFontWeight('bold');
+    h.setFrozenRows(1);
+  } else if (h.getLastRow() === 0) {
+    h.getRange(1, 1, 1, 2).setValues([['clave', 'valor']]).setFontWeight('bold');
+    h.setFrozenRows(1);
+  }
+  return h;
+}
+
+function leerMetaValor_(clave) {
+  try {
+    const h = asegurarMetaHoja_();
+    const last = h.getLastRow();
+    if (last < 2) return '';
+    const vals = h.getRange(2, 1, last, 2).getValues();
+    const target = String(clave || '');
+    for (let i = 0; i < vals.length; i++) {
+      if (String(vals[i][0] || '') === target) return String(vals[i][1] || '').trim();
+    }
+    return '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function escribirMetaValor_(clave, valor) {
+  const h = asegurarMetaHoja_();
+  const key = String(clave || '');
+  const val = String(valor || '');
+  const last = h.getLastRow();
+  if (last >= 2) {
+    const vals = h.getRange(2, 1, last, 2).getValues();
+    for (let i = 0; i < vals.length; i++) {
+      if (String(vals[i][0] || '') === key) {
+        h.getRange(2 + i, 2).setValue(val);
+        return;
+      }
+    }
+  }
+  h.appendRow([key, val]);
+}
+
+function getDataVersion_(sheetId) {
+  const id = String(sheetId || sheetIdParaCache_());
+  if (_dataVersionMem[id] != null) return _dataVersionMem[id];
+  const v = leerMetaValor_(META_DATA_VERSION_KEY) || '0';
+  _dataVersionMem[id] = v;
+  return v;
+}
+
+function bumpDataVersion_(sheetId) {
+  const id = String(sheetId || sheetIdParaCache_());
+  const v = String(Date.now()) + '-' + String(Math.floor(Math.random() * 1e6));
+  try {
+    escribirMetaValor_(META_DATA_VERSION_KEY, v);
+  } catch (e) { /* best-effort */ }
+  _dataVersionMem[id] = v;
+  return v;
+}
+
+function saldosCacheKey_(sheetId) {
+  const id = String(sheetId || sheetIdParaCache_());
+  return 'saldos:' + id + ':' + getDataVersion_(id);
+}
+
+function cloneCuentasComputed_(data) {
+  try {
+    return JSON.parse(JSON.stringify(data || []));
+  } catch (e) {
+    return (data || []).map(function (c) {
+      const copia = Object.assign({}, c);
+      if (c.subcuentas) copia.subcuentas = c.subcuentas.map(function (s) { return Object.assign({}, s); });
+      if (c.evolucion) copia.evolucion = c.evolucion.map(function (e) { return Object.assign({}, e); });
+      return copia;
+    });
+  }
+}
+
+// Formato compacto v1 para Script Cache: arrays posicionales (menos claves
+// repetidas → JSON más pequeño y mejor ratio gzip).
+// Cuenta:  [id, nombre, tipo, moneda, icono, saldo_inicial, saldo, evolucion[], subcuentas[]]
+// Evolución: [mes, saldo]
+// Subcuenta: [id, nombre, parent_id, saldo_inicial, saldo, orden]
+function packSaldosCache_(cuentas) {
+  return {
+    v: 1,
+    c: (cuentas || []).map(function (cta) {
+      return [
+        cta.id,
+        cta.nombre,
+        cta.tipo,
+        cta.moneda,
+        cta.icono || '',
+        Number(cta.saldo_inicial || 0),
+        Number(cta.saldo || 0),
+        (cta.evolucion || []).map(function (e) {
+          return [e.mes, Number(e.saldo || 0)];
+        }),
+        (cta.subcuentas || []).map(function (s) {
+          return [
+            s.id,
+            s.nombre,
+            s.parent_id || '',
+            Number(s.saldo_inicial || 0),
+            Number(s.saldo || 0),
+            Number(s.orden || 99)
+          ];
+        })
+      ];
+    })
+  };
+}
+
+function unpackSaldosCache_(packed) {
+  if (!packed || packed.v !== 1 || !Array.isArray(packed.c)) return null;
+  return packed.c.map(function (r) {
+    return {
+      id: r[0],
+      nombre: r[1],
+      tipo: r[2],
+      moneda: r[3],
+      icono: r[4] || '',
+      saldo_inicial: Number(r[5] || 0),
+      saldo: Number(r[6] || 0),
+      evolucion: (r[7] || []).map(function (e) {
+        return { mes: e[0], saldo: Number(e[1] || 0) };
+      }),
+      subcuentas: (r[8] || []).map(function (s) {
+        return {
+          id: s[0],
+          nombre: s[1],
+          parent_id: s[2] || '',
+          saldo_inicial: Number(s[3] || 0),
+          saldo: Number(s[4] || 0),
+          orden: Number(s[5] || 99)
+        };
+      })
+    };
+  });
+}
+
+function invalidateSaldosCache_() {
+  _cuentasComputedCache = null;
+  _cuentasComputedSheetId = '';
+  cacheRemove_(saldosCacheKey_());
+}
+
 function leerHoja(nombre) {
   if (_sheetReadCache[nombre]) return cloneRows_(_sheetReadCache[nombre]);
   asegurarHoja(nombre);
@@ -1002,6 +1322,10 @@ function escribirHoja(nombre, filas) {
   if (matriz.length) h.getRange(1, 1, matriz.length, cab.length).setValues(matriz);
   h.setFrozenRows(1);
   _sheetReadCache[nombre] = cloneRows_(filas);
+  // Cualquier cambio en cuentas o movimientos invalida saldos materializados.
+  if (nombre === 'Cuentas' || nombre === 'Transacciones') {
+    invalidateSaldosCache_();
+  }
 }
 
 function upsertFila(nombre, fila) {
@@ -1214,12 +1538,28 @@ function incluir(html) { return HtmlService.createHtmlOutputFromFile(html).getCo
 
 // ───────── Cuentas ─────────
 function obtenerCuentas() {
+  const sheetId = sheetIdParaCache_();
+  // 1) Memoria de la request (bootstrap llama obtenerCuentas varias veces).
+  if (_cuentasComputedCache && _cuentasComputedSheetId === sheetId) {
+    return cloneCuentasComputed_(_cuentasComputedCache);
+  }
+  // 2) Script Cache entre requests del mismo spreadsheet (formato compacto).
+  const cachedPacked = cacheGetJson_(saldosCacheKey_(sheetId));
+  if (cachedPacked) {
+    const cached = unpackSaldosCache_(cachedPacked) || (Array.isArray(cachedPacked) ? cachedPacked : null);
+    if (cached) {
+      _cuentasComputedCache = cached;
+      _cuentasComputedSheetId = sheetId;
+      return cloneCuentasComputed_(cached);
+    }
+  }
+
   const cuentas = filasVisibles_('Cuentas').filter(c => !c.oculta);
   const txs = leerHoja('Transacciones');
   const fmtMes = d => Utilities.formatDate(d, ssActiva_().getSpreadsheetTimeZone(), 'yyyy-MM');
 
   const top = cuentas.filter(c => !c.parent_id).sort((a, b) => Number(a.orden || 99) - Number(b.orden || 99));
-  return top.map(c => {
+  const result = top.map(c => {
     const subs = cuentas.filter(x => x.parent_id === c.id);
     const subIds = new Set(subs.map(x => x.id));
     const parentInitial = Number(c.saldo_inicial || 0);
@@ -1307,6 +1647,11 @@ function obtenerCuentas() {
       subcuentas
     };
   });
+
+  _cuentasComputedCache = result;
+  _cuentasComputedSheetId = sheetId;
+  cachePutJson_(saldosCacheKey_(sheetId), packSaldosCache_(result), CACHE_TTL_SALDOS_SEC);
+  return cloneCuentasComputed_(result);
 }
 
 // Variación de saldo que aporta una transacción a una cuenta concreta.
