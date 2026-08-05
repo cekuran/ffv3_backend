@@ -1292,7 +1292,11 @@ function unpackSaldosCache_(packed) {
 function invalidateSaldosCache_() {
   _cuentasComputedCache = null;
   _cuentasComputedSheetId = '';
-  cacheRemove_(saldosCacheKey_());
+  // Antes de subir la versión, borramos la entrada actual (best-effort).
+  try { cacheRemove_(saldosCacheKey_()); } catch (e) { /* ignore */ }
+  // Nueva generación → la siguiente lectura usa una clave distinta y no
+  // puede reutilizar el JSON antiguo aunque CacheService aún lo conserve.
+  bumpDataVersion_();
 }
 
 function leerHoja(nombre) {
