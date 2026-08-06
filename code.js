@@ -145,6 +145,9 @@ function tokenCacheKey_(token) {
   return 'tok:' + String(token || '').trim();
 }
 
+// ponytail: prefijo auth:* es global a propósito — las hojas Usuarios/Tokens/
+// HojasUsuarios/Spreadsheets/Config viven en el spreadsheet maestro y son
+// compartidas por todos los usuarios. No namespaciar por usuario.
 function authSheetCacheKey_(nombre) {
   return 'auth:' + String(nombre || '');
 }
@@ -1208,9 +1211,17 @@ function bumpDataVersion_(sheetId) {
   return v;
 }
 
+// ponytail: scope por spreadsheetId + usuario + data_version. Permite que dos
+// usuarios compartan spreadsheet (caso colaborativo) sin colisionar: cada
+// uno ve sus propios saldos cacheados. data_version (hoja _meta del sheet
+// compartido) descarta entradas obsoletas cuando CUALQUIER usuario muta el
+// sheet — un bump de version hace inaccesibles los caches de todos los
+// usuarios hasta que se revaliden contra el sheet. invalidateSaldosCache_
+// solo borra la entrada del usuario actual; las de los demás quedan
+// huérfanas hasta que la version cambie o expire el TTL.
 function saldosCacheKey_(sheetId) {
   const id = String(sheetId || sheetIdParaCache_());
-  return 'saldos:' + id + ':' + getDataVersion_(id);
+  return 'saldos:' + id + ':' + (currentUser_() || 'anon') + ':' + getDataVersion_(id);
 }
 
 function cloneCuentasComputed_(data) {
