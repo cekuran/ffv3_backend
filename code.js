@@ -7,7 +7,7 @@ const SCHEMA = {
   Categorias:    ['owner','id','nombre','color','icono','tipo','orden'],
   Establecimientos:['owner','id','nombre'],
   Transacciones: ['owner','id','fecha','tipo','importe','moneda','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id'],
-  Recurrentes:   ['owner','id','plantilla','ultima_generacion','activa'],
+  Recurrentes:   ['owner','id','plantilla','ultima_generacion','activa','mes_inicio','anio_inicio'],
   Presupuestos:  ['owner','id','anio','mes','categoria_id','importe_esperado'],
   Conciliaciones:['owner','id','fecha','cuenta_id','saldo_sistema','saldo_banco','diferencia','notas'],
   TiposCambio:   ['owner','id','fecha','base','destino','ratio']
@@ -2251,6 +2251,14 @@ function actualizarPlantillaRecurrente_(owner, recurrenteId, tx, filaTx) {
   if (!merged.inicio) merged.inicio = actual.ultima_generacion || iso_(filaTx.fecha) || plantilla.inicio || '';
   validarPlantillaRecurrente_(owner, merged);
   datos[idx].plantilla = JSON.stringify(merged);
+  // ponytail: editar la tx original también reposiciona mes_inicio/anio_inicio
+  // del recurrente a la fecha de esa tx. Útil cuando el usuario crea un
+  // recurrente y luego decide "esto arrancó el mes X" sin tocar el sheet.
+  const fechaRef = parseFecha(filaTx.fecha);
+  if (fechaRef && !isNaN(fechaRef)) {
+    datos[idx].mes_inicio = fechaRef.getMonth() + 1;
+    datos[idx].anio_inicio = fechaRef.getFullYear();
+  }
   escribirHoja('Recurrentes', datos);
 }
 
@@ -2262,7 +2270,9 @@ function eliminarTransaccion(id) {
 // ───────── Recurrentes ─────────
 function obtenerRecurrentes() {
   return filasVisibles_('Recurrentes').map(r => ({
-    id: r.id, plantilla: r.plantilla, ultima_generacion: r.ultima_generacion, activa: r.activa === true || r.activa === 'true'
+    id: r.id, plantilla: r.plantilla, ultima_generacion: r.ultima_generacion, activa: r.activa === true || r.activa === 'true',
+    mes_inicio: r.mes_inicio != null && r.mes_inicio !== '' ? Number(r.mes_inicio) : null,
+    anio_inicio: r.anio_inicio != null && r.anio_inicio !== '' ? Number(r.anio_inicio) : null
   }));
 }
 
@@ -2353,15 +2363,45 @@ function guardarRecurrente(rec) {
   if (!rec.plantilla) throw new Error('Falta plantilla');
   const plantilla = typeof rec.plantilla === 'string' ? JSON.parse(rec.plantilla) : Object.assign({}, rec.plantilla);
   validarPlantillaRecurrente_(owner, plantilla);
+  const datos = leerHoja('Recurrentes');
+  const existente = rec.id ? datos.find(r => r.id === rec.id) : null;
+  // ponytail: mes_inicio/anio_inicio se aceptan como columnas propias o como
+  // campos dentro de la plantilla; lo que llegue escrito gana. Si no llegan
+  // ni en payload ni en la plantilla, conservan lo que ya tenía la fila.
+  let mes = normalizarMesInicio_(rec.mes_inicio != null ? rec.mes_inicio : (plantilla.mes_inicio != null ? plantilla.mes_inicio : null));
+  let anio = normalizarAnioInicio_(rec.anio_inicio != null ? rec.anio_inicio : (plantilla.anio_inicio != null ? plantilla.anio_inicio : null));
+  if ((mes == null || anio == null) && existente) {
+    if (mes == null) mes = existente.mes_inicio != null && existente.mes_inicio !== '' ? Number(existente.mes_inicio) : null;
+    if (anio == null) anio = existente.anio_inicio != null && existente.anio_inicio !== '' ? Number(existente.anio_inicio) : null;
+  }
+  if ((mes == null) !== (anio == null)) {
+    throw new Error('mes_inicio y anio_inicio deben ir los dos o ninguno');
+  }
   const fila = {
     owner: owner,
     id: rec.id || uid_('rec'),
     plantilla: JSON.stringify(plantilla),
-    ultima_generacion: rec.ultima_generacion || '',
-    activa: rec.activa !== false
+    ultima_generacion: rec.ultima_generacion || (existente && existente.ultima_generacion) || '',
+    activa: rec.activa !== false,
+    mes_inicio: mes == null ? '' : mes,
+    anio_inicio: anio == null ? '' : anio
   };
   upsertFila('Recurrentes', fila);
   return obtenerRecurrentes();
+}
+
+function normalizarMesInicio_(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 12) throw new Error('mes_inicio debe ser un entero entre 1 y 12');
+  return n;
+}
+
+function normalizarAnioInicio_(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1900 || n > 3000) throw new Error('anio_inicio debe ser un año válido');
+  return n;
 }
 
 function eliminarRecurrente(id) {
@@ -2370,6 +2410,8 @@ function eliminarRecurrente(id) {
 }
 
 function upsertRecurrenteBase_(owner, tx) {
+  const fechaIso = iso_(tx.fecha);
+  const fechaObj = parseFecha(fechaIso) || new Date();
   const plantilla = {
     tipo: tx.tipo, importe: Number(tx.importe), cuenta_id: tx.cuenta_id,
     subcuenta_id: tx.subcuenta_id || '',
@@ -2380,12 +2422,13 @@ function upsertRecurrenteBase_(owner, tx) {
     reparto_destino: Array.isArray(tx.reparto_destino) ? JSON.stringify(tx.reparto_destino) : (tx.reparto_destino || ''),
     categoria_id: tx.categoria_id || '', establecimiento_id: tx.establecimiento_id || '', descripcion: tx.descripcion || '',
     periodo_meses: Number(tx.recurrente_periodo_meses || 1), dia_mes: tx.recurrente_dia || Number(String(tx.fecha).slice(8, 10)),
-    inicio: iso_(tx.fecha), fin: tx.recurrente_fin || ''
+    inicio: fechaIso, fin: tx.recurrente_fin || ''
   };
   const id = uid_('rec');
   const fila = {
     owner: owner, id,
-    plantilla: JSON.stringify(plantilla), ultima_generacion: iso_(tx.fecha), activa: true
+    plantilla: JSON.stringify(plantilla), ultima_generacion: fechaIso, activa: true,
+    mes_inicio: fechaObj.getMonth() + 1, anio_inicio: fechaObj.getFullYear()
   };
   const datos = leerHoja('Recurrentes');
   datos.push(fila);
@@ -2404,12 +2447,22 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
       const periodo = Number(p.periodo_meses) || 1;
       const dia = Number(p.dia_mes) || 1;
       const inicio = parseFecha(p.inicio) || new Date();
+      // ponytail: mes_inicio/anio_inicio definen desde qué mes/año se generan
+      // transacciones. Si están,ganan sobre el mes de inicio legacy; el día
+      // sigue siendo el de dia_mes. Vacío = comportamiento heredado.
+      const mesIniRaw = r.mes_inicio != null && r.mes_inicio !== '' ? Number(r.mes_inicio) : null;
+      const anioIniRaw = r.anio_inicio != null && r.anio_inicio !== '' ? Number(r.anio_inicio) : null;
       let cursor;
       if (r.ultima_generacion) {
         const u = parseFecha(r.ultima_generacion);
         cursor = u && !isNaN(u) ? new Date(u) : new Date(inicio);
       } else {
         cursor = new Date(inicio);
+      }
+      if (mesIniRaw && anioIniRaw) {
+        const minY = anioIniRaw * 12 + (mesIniRaw - 1);
+        const curY = cursor.getFullYear() * 12 + cursor.getMonth();
+        if (curY < minY) cursor = new Date(anioIniRaw, mesIniRaw - 1, 1);
       }
       cursor.setDate(dia);
       while (cursor <= fechaCorte) {
