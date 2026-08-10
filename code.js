@@ -1357,7 +1357,7 @@ function upsertFila(nombre, fila) {
     // Fila de datos en sheet = idx + 2 (cabecera en 1)
     const rowNum = idx + 2;
     const valores = cab.map(k => fila[k] != null ? fila[k] : '');
-    h.getRange(rowNum, 1, rowNum, cab.length).setValues([valores]);
+    h.getRange(rowNum, 1, 1, cab.length).setValues([valores]);
   } else {
     datos.push(fila);
     const h = ssActiva_().getSheetByName(nombre);
@@ -1369,7 +1369,7 @@ function upsertFila(nombre, fila) {
       h.setFrozenRows(1);
     }
     const valores = cab.map(k => fila[k] != null ? fila[k] : '');
-    h.getRange(rowNum, 1, rowNum, cab.length).setValues([valores]);
+    h.getRange(rowNum, 1, 1, cab.length).setValues([valores]);
   }
   _sheetReadCache[nombre] = cloneRows_(datos);
   if (nombre === 'Cuentas' || nombre === 'Transacciones') {
