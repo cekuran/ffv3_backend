@@ -1343,16 +1343,38 @@ function escribirHoja(nombre, filas) {
   }
 }
 
+// Escritura de una sola fila: actualiza o añade sin reescribir toda la hoja.
+// Reduce latencia de guardado (especialmente Transacciones/Recurrentes grandes).
 function upsertFila(nombre, fila) {
   const datos = leerHoja(nombre);
+  const cab = SCHEMA[nombre];
+  if (!cab) throw new Error('Hoja desconocida: ' + nombre);
   const idx = datos.findIndex(f => f.id === fila.id);
   if (idx >= 0) {
     fila = Object.assign({}, datos[idx], fila, { owner: datos[idx].owner });
     datos[idx] = fila;
+    const h = ssActiva_().getSheetByName(nombre);
+    // Fila de datos en sheet = idx + 2 (cabecera en 1)
+    const rowNum = idx + 2;
+    const valores = cab.map(k => fila[k] != null ? fila[k] : '');
+    h.getRange(rowNum, 1, rowNum, cab.length).setValues([valores]);
   } else {
     datos.push(fila);
+    const h = ssActiva_().getSheetByName(nombre);
+    const last = h.getLastRow();
+    const rowNum = Math.max(last, 1) + 1;
+    // Si la hoja está vacía o solo tiene cabecera parcial, asegurar cabecera.
+    if (last < 1) {
+      h.getRange(1, 1, 1, cab.length).setValues([cab]).setFontWeight('bold');
+      h.setFrozenRows(1);
+    }
+    const valores = cab.map(k => fila[k] != null ? fila[k] : '');
+    h.getRange(rowNum, 1, rowNum, cab.length).setValues([valores]);
   }
-  escribirHoja(nombre, datos);
+  _sheetReadCache[nombre] = cloneRows_(datos);
+  if (nombre === 'Cuentas' || nombre === 'Transacciones') {
+    invalidateSaldosCache_();
+  }
   return fila;
 }
 
@@ -1494,6 +1516,7 @@ function bootstrapBase() {
     return {
       sesion: { user: owner, rol: currentRol_() || ROLES.BASICO },
       version: APP_VERSION,
+      data_version: '',
       hojas: [],
       hojaActivaId: '',
       cuentas: [],
@@ -1522,6 +1545,7 @@ function bootstrapBase() {
   return {
     sesion: { user: owner, rol: currentRol_() || ROLES.BASICO },
     version: APP_VERSION,
+    data_version: getDataVersion_(hojaActivaId),
     hojas: hojasUsuario,
     hojaActivaId: hojaActivaId,
     cuentas: obtenerCuentas(),
@@ -2087,6 +2111,22 @@ function guardarTransaccion(tx) {
   const txs = leerHoja('Transacciones');
   const existente = tx.id ? txs.find(t => t.id === tx.id) : null;
   if (tx.id && !existente) throw new Error('Transacción no encontrada');
+  // Concurrencia optimista: si el cliente envía la fecha_ultima_edicion que
+  // conocía al abrir el formulario y el servidor tiene otra, hay conflicto.
+  if (existente && tx.base_fecha_ultima_edicion != null && tx.base_fecha_ultima_edicion !== '') {
+    const base = String(tx.base_fecha_ultima_edicion || '');
+    const actual = String(existente.fecha_ultima_edicion || '');
+    if (base !== actual) {
+      throw new Error('CONFLICT:' + JSON.stringify({
+        tipo: 'transaccion',
+        id: existente.id,
+        mensaje: 'Esta transacción fue modificada por otro usuario o en otra pestaña.',
+        fecha_ultima_edicion: actual,
+        ultima_edicion_por: existente.ultima_edicion_por || '',
+        transaccion: existente
+      }));
+    }
+  }
   const ownerTx = existente ? String(existente.owner || owner) : owner;
   const cuentasHoja = leerHoja('Cuentas');
   let establecimiento_id = '';
@@ -2204,18 +2244,35 @@ function guardarTransaccion(tx) {
   // ponytail: si la tx ya está vinculada a un recurrente, actualizar ese en
   // lugar de crear uno nuevo. Mantiene las txs generadas previas apuntando al
   // mismo id.
+  let recurrentesActualizados = null;
   if (tx.recurrente_plantilla) {
     if (fila.recurrente_id) {
       actualizarPlantillaRecurrente_(owner, fila.recurrente_id, tx, fila);
+      recurrentesActualizados = obtenerRecurrentes();
     } else {
       const nuevoId = upsertRecurrenteBase_(owner, tx);
       if (nuevoId) {
         fila.recurrente_id = nuevoId;
         upsertFila('Transacciones', fila);
       }
+      recurrentesActualizados = obtenerRecurrentes();
     }
+  } else if (tx.recurrente_id === '') {
+    // Desvinculación explícita: el frontend puede haber eliminado el recurrente
+    // por separado; devolvemos la lista actual para que la UI no quede stale.
+    recurrentesActualizados = obtenerRecurrentes();
   }
-  return fila;
+  // Payload enriquecido para refresco ligero en el cliente.
+  // Campos de la tx se mantienen en el top-level por compatibilidad (self-tests).
+  // No recalculamos obtenerCuentas() aquí: es caro tras invalidar el cache de
+  // saldos. El frontend mantiene un cache local de saldos y aplica el delta
+  // de la tx (crear/editar) sin esperar este recálculo.
+  return Object.assign({}, fila, {
+    transaccion: fila,
+    cuentas: null,
+    recurrentes: recurrentesActualizados,
+    data_version: getDataVersion_()
+  });
 }
 
 // ponytail: actualiza la plantilla de un recurrente existente a partir de la
@@ -2259,12 +2316,31 @@ function actualizarPlantillaRecurrente_(owner, recurrenteId, tx, filaTx) {
     datos[idx].mes_inicio = fechaRef.getMonth() + 1;
     datos[idx].anio_inicio = fechaRef.getFullYear();
   }
-  escribirHoja('Recurrentes', datos);
+  // Actualizar solo la fila afectada (evita reescribir toda la hoja).
+  upsertFila('Recurrentes', datos[idx]);
 }
 
-function eliminarTransaccion(id) {
+function eliminarTransaccion(id, baseFechaUltimaEdicion) {
+  const txs = leerHoja('Transacciones');
+  const existente = txs.find(t => t.id === id) || null;
+  if (!existente) throw new Error('Transacción no encontrada');
+  // Concurrencia optimista opcional en borrado.
+  if (baseFechaUltimaEdicion != null && baseFechaUltimaEdicion !== '') {
+    const base = String(baseFechaUltimaEdicion || '');
+    const actual = String(existente.fecha_ultima_edicion || '');
+    if (base !== actual) {
+      throw new Error('CONFLICT:' + JSON.stringify({
+        tipo: 'transaccion',
+        id: existente.id,
+        mensaje: 'Esta transacción fue modificada por otro usuario o en otra pestaña y ya no se puede eliminar con la versión local.',
+        fecha_ultima_edicion: actual,
+        ultima_edicion_por: existente.ultima_edicion_por || '',
+        transaccion: existente
+      }));
+    }
+  }
   eliminarFila('Transacciones', id);
-  return { ok: true };
+  return { ok: true, data_version: getDataVersion_() };
 }
 
 // ───────── Recurrentes ─────────
@@ -2430,9 +2506,7 @@ function upsertRecurrenteBase_(owner, tx) {
     plantilla: JSON.stringify(plantilla), ultima_generacion: fechaIso, activa: true,
     mes_inicio: fechaObj.getMonth() + 1, anio_inicio: fechaObj.getFullYear()
   };
-  const datos = leerHoja('Recurrentes');
-  datos.push(fila);
-  escribirHoja('Recurrentes', datos);
+  upsertFila('Recurrentes', fila);
   return id;
 }
 
