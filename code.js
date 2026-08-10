@@ -1345,10 +1345,13 @@ function escribirHoja(nombre, filas) {
 
 // Escritura de una sola fila: actualiza o añade sin reescribir toda la hoja.
 // Reduce latencia de guardado (especialmente Transacciones/Recurrentes grandes).
+// IMPORTANTE: getRange(row, column, numRows, numColumns) usa conteos, NO
+// índices finales. Para 1 fila: getRange(rowNum, 1, 1, nCols).
 function upsertFila(nombre, fila) {
   const datos = leerHoja(nombre);
   const cab = SCHEMA[nombre];
   if (!cab) throw new Error('Hoja desconocida: ' + nombre);
+  const nCols = cab.length;
   const idx = datos.findIndex(f => f.id === fila.id);
   if (idx >= 0) {
     fila = Object.assign({}, datos[idx], fila, { owner: datos[idx].owner });
@@ -1357,19 +1360,19 @@ function upsertFila(nombre, fila) {
     // Fila de datos en sheet = idx + 2 (cabecera en 1)
     const rowNum = idx + 2;
     const valores = cab.map(k => fila[k] != null ? fila[k] : '');
-    h.getRange(rowNum, 1, 1, cab.length).setValues([valores]);
+    h.getRange(rowNum, 1, 1, nCols).setValues([valores]);
   } else {
     datos.push(fila);
     const h = ssActiva_().getSheetByName(nombre);
     const last = h.getLastRow();
-    const rowNum = Math.max(last, 1) + 1;
     // Si la hoja está vacía o solo tiene cabecera parcial, asegurar cabecera.
     if (last < 1) {
-      h.getRange(1, 1, 1, cab.length).setValues([cab]).setFontWeight('bold');
+      h.getRange(1, 1, 1, nCols).setValues([cab]).setFontWeight('bold');
       h.setFrozenRows(1);
     }
+    const rowNum = Math.max(last, 1) + 1;
     const valores = cab.map(k => fila[k] != null ? fila[k] : '');
-    h.getRange(rowNum, 1, 1, cab.length).setValues([valores]);
+    h.getRange(rowNum, 1, 1, nCols).setValues([valores]);
   }
   _sheetReadCache[nombre] = cloneRows_(datos);
   if (nombre === 'Cuentas' || nombre === 'Transacciones') {
