@@ -2708,7 +2708,32 @@ function obtenerResumen(anio, mes) {
   const proximos = recs.map(r => {
     try {
       const p = JSON.parse(r.plantilla);
-      return { id: r.id, descripcion: p.descripcion, importe: Number(p.importe), dia_mes: p.dia_mes, periodo_meses: p.periodo_meses || 1 };
+      const periodo = Number(p.periodo_meses) || 1;
+      const dia = Number(p.dia_mes) || 1;
+      const inicio = parseFecha(p.inicio) || new Date();
+      const mesIniRaw = r.mes_inicio != null && r.mes_inicio !== '' ? Number(r.mes_inicio) : null;
+      const anioIniRaw = r.anio_inicio != null && r.anio_inicio !== '' ? Number(r.anio_inicio) : null;
+      let cursor;
+      if (r.ultima_generacion) {
+        const u = parseFecha(r.ultima_generacion);
+        cursor = u && !isNaN(u) ? new Date(u) : new Date(inicio);
+      } else {
+        cursor = new Date(inicio);
+      }
+      if (mesIniRaw && anioIniRaw) {
+        const minY = anioIniRaw * 12 + (mesIniRaw - 1);
+        const curY = cursor.getFullYear() * 12 + cursor.getMonth();
+        if (curY < minY) cursor = new Date(anioIniRaw, mesIniRaw - 1, 1);
+      }
+      cursor.setDate(dia);
+      // ponytail: avanza el cursor hasta el primer disparo estrictamente posterior a hoy
+      const hoy = new Date();
+      while (cursor <= hoy) cursor = siguienteCursor_(cursor, periodo);
+      return {
+        id: r.id, descripcion: p.descripcion, importe: Number(p.importe),
+        dia_mes: p.dia_mes, periodo_meses: p.periodo_meses || 1,
+        proximo_disparo: iso_(cursor)
+      };
     } catch (e) {
       return null;
     }
