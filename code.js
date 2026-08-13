@@ -2604,9 +2604,8 @@ function txConflictaEnMesRecurrente_(txs, r, p, isoCursor) {
 }
 
 function siguienteCursor_(d, periodoMeses) {
-  const f = new Date(d);
-  f.setMonth(f.getMonth() + Number(periodoMeses || 1));
-  return f;
+  const p = Number(periodoMeses || 1);
+  return new Date(d.getFullYear(), d.getMonth() + p, d.getDate());
 }
 
 function generarRecurrentesPendientes(fechaCorte) {
