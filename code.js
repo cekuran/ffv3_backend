@@ -1063,8 +1063,19 @@ function listarOwnersConDatos_() {
   return [...owners];
 }
 function uid_(prefixo) { return (prefixo || 'id') + '_' + Utilities.getUuid().slice(0, 8); }
-function isoHoy_() { return new Date().toISOString().slice(0, 10); }
-function isoAhora_() { return new Date().toISOString(); }
+// Timezone canónico de la app = timezone de la hoja activa.
+// Configura la hoja y el proyecto Apps Script en Europe/Madrid para evitar desfases.
+function tz_() {
+  try { return ssActiva_().getSpreadsheetTimeZone(); }
+  catch (e) { return Session.getScriptTimeZone() || 'Europe/Madrid'; }
+}
+// Hoy en el timezone de la hoja (NO UTC).
+function isoHoy_() {
+  return Utilities.formatDate(new Date(), tz_(), 'yyyy-MM-dd');
+}
+function isoAhora_() {
+  return Utilities.formatDate(new Date(), tz_(), "yyyy-MM-dd'T'HH:mm:ss");
+}
 
 function asegurarHoja(nombre) {
   const ss = ssActiva_();
@@ -1109,7 +1120,7 @@ function migrarEsquema() {
 // que cuando se escribieron.
 function normalizarValor_(v) {
   if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v)) {
-    return Utilities.formatDate(v, ssActiva_().getSpreadsheetTimeZone(), 'yyyy-MM-dd');
+    return Utilities.formatDate(v, tz_(), 'yyyy-MM-dd');
   }
   return v;
 }
@@ -1598,7 +1609,7 @@ function obtenerCuentas() {
 
   const cuentas = filasVisibles_('Cuentas').filter(c => !c.oculta);
   const txs = leerHoja('Transacciones');
-  const fmtMes = d => Utilities.formatDate(d, ssActiva_().getSpreadsheetTimeZone(), 'yyyy-MM');
+  const fmtMes = d => Utilities.formatDate(d, tz_(), 'yyyy-MM');
 
   const top = cuentas.filter(c => !c.parent_id).sort((a, b) => Number(a.orden || 99) - Number(b.orden || 99));
   const result = top.map(c => {
@@ -2003,13 +2014,21 @@ function eliminarEstablecimiento(id) {
 }
 
 // ───────── Transacciones ─────────
+// Parsea "yyyy-MM-dd" como fecha de calendario local (no UTC).
+// new Date("yyyy-MM-dd") interpreta medianoche UTC y desplaza el día en España.
 function parseFecha(s) {
   if (!s) return null;
   if (Object.prototype.toString.call(s) === '[object Date]') return s;
+  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) {
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  }
   const d = new Date(s);
   return isNaN(d) ? null : d;
 }
-function iso_(d) { return Utilities.formatDate(new Date(d), ssActiva_().getSpreadsheetTimeZone(), 'yyyy-MM-dd'); }
+function iso_(d) {
+  return Utilities.formatDate(new Date(d), tz_(), 'yyyy-MM-dd');
+}
 
 // Reparto destino: array de {subcuenta_id, importe} guardado como JSON en
 // Transacciones.reparto_destino. Acepta string, array o null; devuelve array
@@ -2521,28 +2540,39 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
   recs.forEach(r => {
     try {
       const p = JSON.parse(r.plantilla);
-      const periodo = Number(p.periodo_meses) || 1;
-      const dia = Number(p.dia_mes) || 1;
+      const periodo = Math.max(1, Number(p.periodo_meses) || 1);
+      const dia = Math.min(31, Math.max(1, Number(p.dia_mes) || 1));
       const inicio = parseFecha(p.inicio) || new Date();
       // ponytail: mes_inicio/anio_inicio definen desde qué mes/año se generan
-      // transacciones. Si están,ganan sobre el mes de inicio legacy; el día
+      // transacciones. Si están, ganan sobre el mes de inicio legacy; el día
       // sigue siendo el de dia_mes. Vacío = comportamiento heredado.
       const mesIniRaw = r.mes_inicio != null && r.mes_inicio !== '' ? Number(r.mes_inicio) : null;
       const anioIniRaw = r.anio_inicio != null && r.anio_inicio !== '' ? Number(r.anio_inicio) : null;
-      let cursor;
+      let base;
       if (r.ultima_generacion) {
         const u = parseFecha(r.ultima_generacion);
-        cursor = u && !isNaN(u) ? new Date(u) : new Date(inicio);
+        base = u && !isNaN(u) ? new Date(u) : new Date(inicio);
       } else {
-        cursor = new Date(inicio);
+        base = new Date(inicio);
       }
       if (mesIniRaw && anioIniRaw) {
         const minY = anioIniRaw * 12 + (mesIniRaw - 1);
-        const curY = cursor.getFullYear() * 12 + cursor.getMonth();
-        if (curY < minY) cursor = new Date(anioIniRaw, mesIniRaw - 1, 1);
+        const curY = base.getFullYear() * 12 + base.getMonth();
+        if (curY < minY) base = new Date(anioIniRaw, mesIniRaw - 1, 1);
       }
-      cursor.setDate(dia);
-      while (cursor <= fechaCorte) {
+      // Primera ocurrencia del día en el mes de base (o último día del mes si no existe).
+      let cursor = fechaConDiaMes_(base.getFullYear(), base.getMonth(), dia);
+      // Si esa fecha ya quedó cubierta por ultima_generacion, avanzar periodos
+      // hasta pasar de ella (evita regenerar el mismo mes).
+      if (r.ultima_generacion) {
+        const uIso = iso_(base);
+        while (iso_(cursor) <= uIso && cursor <= fechaCorte) {
+          cursor = siguienteCursor_(cursor, periodo, dia);
+        }
+      }
+      // Normalizar corte a medianoche local para comparación de día fiable.
+      const corte = new Date(fechaCorte.getFullYear(), fechaCorte.getMonth(), fechaCorte.getDate());
+      while (cursor <= corte) {
         const isoCursor = iso_(cursor);
         // ponytail: idempotencia robusta. Match por (recurrente_id, mes) o
         // por (mes, cuenta, importe, descripcion) para no duplicar el
@@ -2569,9 +2599,9 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
           });
           cambios = true;
         }
-        cursor = siguienteCursor_(cursor, periodo);
+        cursor = siguienteCursor_(cursor, periodo, dia);
       }
-      r.ultima_generacion = iso_(fechaCorte);
+      r.ultima_generacion = iso_(corte);
     } catch (e) {
       // ponytail: plantilla corrupta no debe romper el bootstrap
       Logger.log('plantilla corrupta ' + r.id + ': ' + e.message);
@@ -2603,9 +2633,23 @@ function txConflictaEnMesRecurrente_(txs, r, p, isoCursor) {
   });
 }
 
-function siguienteCursor_(d, periodoMeses) {
-  const p = Number(periodoMeses || 1);
-  return new Date(d.getFullYear(), d.getMonth() + p, d.getDate());
+// ponytail: construye una fecha en año/mes con el día pedido. Si el mes no
+// tiene ese día (31 en feb, 30 en feb, etc.), usa el último día del mes.
+// Así "día 31" se interpreta como "último día del mes".
+function fechaConDiaMes_(year, month, dia) {
+  const last = new Date(year, month + 1, 0).getDate();
+  const d = Math.min(Math.max(1, Number(dia) || 1), last);
+  return new Date(year, month, d);
+}
+
+// Avanza N meses manteniendo el día de la plantilla (o el último día del mes
+// si ese día no existe). Evita el desborde clásico de setMonth con días 29-31.
+function siguienteCursor_(d, periodoMeses, dia) {
+  const meses = Number(periodoMeses) || 1;
+  const targetMonth = d.getMonth() + meses;
+  const year = d.getFullYear() + Math.floor(targetMonth / 12);
+  const month = ((targetMonth % 12) + 12) % 12;
+  return fechaConDiaMes_(year, month, dia != null ? dia : d.getDate());
 }
 
 function generarRecurrentesPendientes(fechaCorte) {
@@ -2707,27 +2751,28 @@ function obtenerResumen(anio, mes) {
   const proximos = recs.map(r => {
     try {
       const p = JSON.parse(r.plantilla);
-      const periodo = Number(p.periodo_meses) || 1;
-      const dia = Number(p.dia_mes) || 1;
+      const periodo = Math.max(1, Number(p.periodo_meses) || 1);
+      const dia = Math.min(31, Math.max(1, Number(p.dia_mes) || 1));
       const inicio = parseFecha(p.inicio) || new Date();
       const mesIniRaw = r.mes_inicio != null && r.mes_inicio !== '' ? Number(r.mes_inicio) : null;
       const anioIniRaw = r.anio_inicio != null && r.anio_inicio !== '' ? Number(r.anio_inicio) : null;
-      let cursor;
+      let base;
       if (r.ultima_generacion) {
         const u = parseFecha(r.ultima_generacion);
-        cursor = u && !isNaN(u) ? new Date(u) : new Date(inicio);
+        base = u && !isNaN(u) ? new Date(u) : new Date(inicio);
       } else {
-        cursor = new Date(inicio);
+        base = new Date(inicio);
       }
       if (mesIniRaw && anioIniRaw) {
         const minY = anioIniRaw * 12 + (mesIniRaw - 1);
-        const curY = cursor.getFullYear() * 12 + cursor.getMonth();
-        if (curY < minY) cursor = new Date(anioIniRaw, mesIniRaw - 1, 1);
+        const curY = base.getFullYear() * 12 + base.getMonth();
+        if (curY < minY) base = new Date(anioIniRaw, mesIniRaw - 1, 1);
       }
-      cursor.setDate(dia);
+      let cursor = fechaConDiaMes_(base.getFullYear(), base.getMonth(), dia);
       // ponytail: avanza el cursor hasta el primer disparo estrictamente posterior a hoy
       const hoy = new Date();
-      while (cursor <= hoy) cursor = siguienteCursor_(cursor, periodo);
+      const hoyMid = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate());
+      while (cursor <= hoyMid) cursor = siguienteCursor_(cursor, periodo, dia);
       return {
         id: r.id, descripcion: p.descripcion, importe: Number(p.importe),
         dia_mes: p.dia_mes, periodo_meses: p.periodo_meses || 1,
