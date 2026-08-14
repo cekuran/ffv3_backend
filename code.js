@@ -2719,11 +2719,10 @@ function conciliar(cuenta_id, saldo_banco, fecha) {
 }
 
 function obtenerConciliaciones(opts) {
-  const owner = username_();
   opts = opts || {};
   const limit = Number(opts.limit) || 0;
   const offset = Number(opts.offset) || 0;
-  let rows = leerHoja('Conciliaciones').filter(c => c.owner === owner);
+  let rows = leerHoja('Conciliaciones');
   rows.sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''));
   const total = rows.length;
   if (limit > 0) rows = rows.slice(offset, offset + limit);
