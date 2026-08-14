@@ -1065,9 +1065,17 @@ function listarOwnersConDatos_() {
 function uid_(prefixo) { return (prefixo || 'id') + '_' + Utilities.getUuid().slice(0, 8); }
 // Timezone canónico de la app = timezone de la hoja activa.
 // Configura la hoja y el proyecto Apps Script en Europe/Madrid para evitar desfases.
+// Cacheado por _currentSheetId porque distintos usuarios pueden tener hojas en
+// distintos timezones (y _currentSheetId cambia por request).
+let _tzCache = null;
+let _tzCacheKey = null;
 function tz_() {
-  try { return ssActiva_().getSpreadsheetTimeZone(); }
-  catch (e) { return Session.getScriptTimeZone() || 'Europe/Madrid'; }
+  const key = _currentSheetId || 'master';
+  if (_tzCache && _tzCacheKey === key) return _tzCache;
+  try { _tzCache = ssActiva_().getSpreadsheetTimeZone(); }
+  catch (e) { _tzCache = Session.getScriptTimeZone() || 'Europe/Madrid'; }
+  _tzCacheKey = key;
+  return _tzCache;
 }
 // Hoy en el timezone de la hoja (NO UTC).
 function isoHoy_() {
