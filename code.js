@@ -3,7 +3,7 @@
 // Multi-usuario: cada fila conserva owner como metadato; el CRUD usa el id global.
 
 const SCHEMA = {
-  Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','fecha_creacion'],
+  Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','establecimiento_id','fecha_creacion'],
   Categorias:    ['owner','id','nombre','color','icono','tipo','orden'],
   Establecimientos:['owner','id','nombre','web'],
   Transacciones: ['owner','id','fecha','tipo','importe','moneda','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id'],
@@ -1867,6 +1867,16 @@ function guardarCuenta(cuenta) {
   // Al editar, preservamos metadatos que el cliente no envía (orden, icono y
   // fecha de creación) para no reiniciarlos y romper el orden de subcuentas.
   const existente = cuenta.id ? todas.find(c => c.id === cuenta.id) : null;
+  // Subcuentas no admiten establecimiento propio (sólo lo gestiona la cuenta padre).
+  const estId = cuenta.parent_id
+    ? ''
+    : (function () {
+        const v = String(cuenta.establecimiento_id == null ? '' : cuenta.establecimiento_id).trim();
+        if (!v) return '';
+        const ok = leerHoja('Establecimientos').some(e => e.id === v);
+        if (!ok) throw new Error('Establecimiento no encontrado');
+        return v;
+      })();
   const fila = {
     owner: (existente && existente.owner) || owner,
     id: cuenta.id || uid_('cta'),
@@ -1878,6 +1888,7 @@ function guardarCuenta(cuenta) {
     saldo_inicial: Number(cuenta.saldo_inicial || 0),
     orden: cuenta.orden || (existente && existente.orden) || 99,
     oculta: !!cuenta.oculta,
+    establecimiento_id: estId,
     fecha_creacion: (existente && existente.fecha_creacion) || isoAhora_()
   };
   upsertFila('Cuentas', fila);
