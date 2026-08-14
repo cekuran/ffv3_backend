@@ -1268,7 +1268,7 @@ function cloneCuentasComputed_(data) {
 
 // Formato compacto v1 para Script Cache: arrays posicionales (menos claves
 // repetidas → JSON más pequeño y mejor ratio gzip).
-// Cuenta:  [id, nombre, tipo, moneda, icono, saldo_inicial, saldo, evolucion[], subcuentas[]]
+// Cuenta:  [id, nombre, tipo, moneda, icono, saldo_inicial, saldo, evolucion[], subcuentas[], establecimiento_id]
 // Evolución: [mes, saldo]
 // Subcuenta: [id, nombre, parent_id, saldo_inicial, saldo, orden]
 function packSaldosCache_(cuentas) {
@@ -1295,7 +1295,8 @@ function packSaldosCache_(cuentas) {
             Number(s.saldo || 0),
             Number(s.orden || 99)
           ];
-        })
+        }),
+        cta.establecimiento_id || ''
       ];
     })
   };
@@ -1324,7 +1325,8 @@ function unpackSaldosCache_(packed) {
           saldo: Number(s[4] || 0),
           orden: Number(s[5] || 99)
         };
-      })
+      }),
+      establecimiento_id: r[9] || ''
     };
   });
 }
@@ -1711,7 +1713,7 @@ function obtenerCuentas() {
     }
 
     return {
-      id: c.id, nombre: c.nombre, tipo: c.tipo, moneda: c.moneda, icono: c.icono,
+      id: c.id, nombre: c.nombre, tipo: c.tipo, moneda: c.moneda, icono: c.icono, establecimiento_id: c.establecimiento_id || '',
       saldo_inicial: parentInitial,
       saldo: parentInitial + parentDelta + subTotal,
       evolucion,
