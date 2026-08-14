@@ -1444,7 +1444,7 @@ const API_ACTIONS = new Set([
   'obtenerEstablecimientos', 'guardarEstablecimiento', 'eliminarEstablecimiento',
   'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion',
   'obtenerRecurrentes', 'guardarRecurrente', 'eliminarRecurrente', 'generarRecurrentesPendientes',
-  'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar',
+  'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar', 'obtenerConciliaciones', 'editarConciliacion', 'eliminarConciliacion',
   'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'ejecutarSelfTestAdmin', 'ping', 'configurarSpreadsheetMaestro'
 ]);
 
@@ -2716,6 +2716,47 @@ function conciliar(cuenta_id, saldo_banco, fecha) {
   });
   escribirHoja('Conciliaciones', eventos);
   return { sistema, banco, diferencia, fecha: fecha || isoHoy_() };
+}
+
+function obtenerConciliaciones(opts) {
+  const owner = username_();
+  opts = opts || {};
+  const limit = Number(opts.limit) || 0;
+  const offset = Number(opts.offset) || 0;
+  let rows = leerHoja('Conciliaciones').filter(c => c.owner === owner);
+  rows.sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''));
+  const total = rows.length;
+  if (limit > 0) rows = rows.slice(offset, offset + limit);
+  return { total, rows };
+}
+
+function editarConciliacion(id, cambios) {
+  const owner = username_();
+  const eventos = leerHoja('Conciliaciones');
+  const idx = eventos.findIndex(c => c.id === id && c.owner === owner);
+  if (idx === -1) throw new Error('Conciliación no encontrada');
+  const actual = eventos[idx];
+  const banco = cambios.saldo_banco !== undefined ? Number(cambios.saldo_banco) : Number(actual.saldo_banco);
+  const sistema = Number(actual.saldo_sistema);
+  const diferencia = +(banco - sistema).toFixed(2);
+  eventos[idx] = Object.assign({}, actual, {
+    saldo_banco: banco,
+    diferencia,
+    notas: cambios.notas !== undefined ? String(cambios.notas || '') : actual.notas
+  });
+  escribirHoja('Conciliaciones', eventos);
+  return eventos[idx];
+}
+
+function eliminarConciliacion(id) {
+  const owner = username_();
+  const eventos = leerHoja('Conciliaciones');
+  const idx = eventos.findIndex(c => c.id === id && c.owner === owner);
+  if (idx === -1) throw new Error('Conciliación no encontrada');
+  // ponytail: no revertimos estado=conciliado en tx porque no sabemos qué eventos marcaron cuáles.
+  eventos.splice(idx, 1);
+  escribirHoja('Conciliaciones', eventos);
+  return { ok: true };
 }
 
 // ───────── Resumen y evolución ─────────
