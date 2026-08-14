@@ -5,7 +5,7 @@
 const SCHEMA = {
   Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','fecha_creacion'],
   Categorias:    ['owner','id','nombre','color','icono','tipo','orden'],
-  Establecimientos:['owner','id','nombre'],
+  Establecimientos:['owner','id','nombre','web'],
   Transacciones: ['owner','id','fecha','tipo','importe','moneda','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id'],
   Recurrentes:   ['owner','id','plantilla','ultima_generacion','activa','mes_inicio','anio_inicio'],
   Presupuestos:  ['owner','id','anio','mes','categoria_id','importe_esperado'],
@@ -1063,6 +1063,16 @@ function listarOwnersConDatos_() {
   return [...owners];
 }
 function uid_(prefixo) { return (prefixo || 'id') + '_' + Utilities.getUuid().slice(0, 8); }
+// Normaliza URL: si el usuario no escribió esquema, asume https://. Acepta
+// sólo http(s); devuelve el origen canónico (esqueme + host, sin path) o
+// cadena vacía si no es http(s).
+function normalizarWeb_(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  const withScheme = /^https?:\/\//i.test(s) ? s : 'https://' + s;
+  const m = /^https?:\/\/([^\/?#]+)/i.exec(withScheme);
+  return m ? m[0].replace(/\/+$/, '') : '';
+}
 // Timezone canónico de la app = timezone de la hoja activa.
 // Configura la hoja y el proyecto Apps Script en Europe/Madrid para evitar desfases.
 // Cacheado por _currentSheetId porque distintos usuarios pueden tener hojas en
@@ -1998,7 +2008,8 @@ function guardarEstablecimiento(est) {
   upsertFila('Establecimientos', {
     owner: (existente && existente.owner) || owner,
     id: existente ? existente.id : uid_('est'),
-    nombre: nombre
+    nombre: nombre,
+    web: normalizarWeb_(input.web)
   });
   return obtenerEstablecimientos();
 }
