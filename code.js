@@ -1730,7 +1730,7 @@ function obtenerCuentas() {
 // Variación de saldo que aporta una transacción a una cuenta concreta.
 function deltaCuenta_(t, cuentaId) {
   if (t.cuenta_id === cuentaId) {
-    if (t.tipo === 'ingreso') return Number(t.importe || 0);
+    if (t.tipo === 'ingreso' || t.tipo === 'devolucion') return Number(t.importe || 0);
     if (t.tipo === 'gasto' || t.tipo === 'transferencia') return -Number(t.importe || 0);
     return 0;
   }
@@ -1748,7 +1748,7 @@ function deltaCuenta_(t, cuentaId) {
 function deltaSubcuenta_(t, subId) {
   let d = 0;
   if (t.subcuenta_id === subId) {
-    if (t.tipo === 'ingreso') d += Number(t.importe || 0);
+    if (t.tipo === 'ingreso' || t.tipo === 'devolucion') d += Number(t.importe || 0);
     else if (t.tipo === 'gasto' || t.tipo === 'transferencia') d += -Number(t.importe || 0);
   }
   if (t.tipo === 'transferencia') {
@@ -2157,7 +2157,7 @@ function guardarTransaccion(tx) {
   const actor = requireUsuario_();
   if (!tx) throw new Error('Transacción vacía');
   const tipo = tx.tipo;
-  if (!['gasto', 'ingreso', 'transferencia'].includes(tipo)) throw new Error('Tipo inválido');
+  if (!['gasto', 'ingreso', 'transferencia', 'devolucion'].includes(tipo)) throw new Error('Tipo inválido');
   if (!tx.cuenta_id) throw new Error('Cuenta obligatoria');
   if (!(Number(tx.importe) > 0)) throw new Error('Importe debe ser > 0');
   const fecha = parseFecha(tx.fecha);
@@ -2248,6 +2248,19 @@ function guardarTransaccion(tx) {
     cuentasHoja.forEach(c => { cuentasById[c.id] = c; });
     const tipoPresupuesto = tipoTransferenciaPresupuesto_(cuentasById, tx.cuenta_id, tx.cuenta_destino_id);
     validarCategoriasTransferencia_(tipoPresupuesto, tx.categoria_id || '', repartoDestinoNormalizado);
+  }
+  if (tipo === 'devolucion') {
+    // ponytail: la categoría de una devolución debe ser de tipo gasto
+    // (revierte un gasto previo). Validación inline para evitar el texto
+    // "para transferencias de" que mete validarCategoriaPorTipo_ para txs
+    // de transferencia.
+    const catsById = {};
+    leerHoja('Categorias').forEach(c => { catsById[c.id] = c; });
+    const idCat = String(tx.categoria_id || '').trim();
+    if (!idCat) throw new Error('Categoría de devolución obligatoria');
+    const cat = catsById[idCat];
+    if (!cat) throw new Error('Categoría de devolución no encontrada');
+    if (cat.tipo !== 'gasto') throw new Error('Categoría de devolución debe ser de tipo gasto');
   }
   const recExistenteId = existente ? (existente.recurrente_id || '') : '';
   const fila = {
@@ -2408,7 +2421,7 @@ function obtenerRecurrentes() {
 
 function validarPlantillaRecurrente_(owner, plantilla) {
   const p = plantilla || {};
-  if (!['gasto', 'ingreso', 'transferencia'].includes(p.tipo)) throw new Error('Tipo inválido');
+  if (!['gasto', 'ingreso', 'transferencia', 'devolucion'].includes(p.tipo)) throw new Error('Tipo inválido');
   if (!p.cuenta_id) throw new Error('Cuenta obligatoria');
   if (!(Number(p.importe) > 0)) throw new Error('Importe debe ser > 0');
   // ponytail: periodo en meses, entero 1-12. Compatibilidad con plantillas
@@ -2441,6 +2454,11 @@ function validarPlantillaRecurrente_(owner, plantilla) {
     if (p.subcuenta_id) {
       const subO = leerHoja('Cuentas').find(c => c.id === p.subcuenta_id && c.parent_id === p.cuenta_id);
       if (!subO) throw new Error('Subcuenta no encontrada o no pertenece a la cuenta');
+    }
+    if (p.tipo === 'devolucion') {
+      const catsById = {};
+      leerHoja('Categorias').forEach(c => { catsById[c.id] = c; });
+      validarCategoriaPorTipo_(catsById, p.categoria_id || '', 'gasto', 'Categoría de devolución');
     }
     return p;
   }
@@ -2796,6 +2814,8 @@ function obtenerResumen(anio, mes) {
   });
   const ingresos = enMes.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + Number(t.importe || 0), 0);
   const gastos = enMes.filter(t => t.tipo === 'gasto').reduce((s, t) => s + Number(t.importe || 0), 0);
+  // ponytail: devoluciones restan del total de gastos del mes (revierte gastos).
+  const devoluciones = enMes.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + Number(t.importe || 0), 0);
   const transferenciasGasto = enMes
     .filter(t => t.tipo === 'transferencia' && tipoTransferenciaPresupuestoTx_(t, cuentasById) === 'gasto')
     .reduce((s, t) => s + Number(t.importe || 0), 0);
@@ -2816,6 +2836,7 @@ function obtenerResumen(anio, mes) {
       mes: k,
       ingresos: en.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + Number(t.importe || 0), 0),
       gastos: en.filter(t => t.tipo === 'gasto').reduce((s, t) => s + Number(t.importe || 0), 0)
+              - en.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + Number(t.importe || 0), 0)
     });
   }
   // Próximos recurrentes
@@ -2859,9 +2880,9 @@ function obtenerResumen(anio, mes) {
     mes: m,
     ingresos,
     ingresosPresupuesto: ingresos + transferenciasIngreso,
-    gastos,
-    gastosPresupuesto: gastos + transferenciasGasto,
-    neto: ingresos - gastos,
+    gastos: gastos - devoluciones,
+    gastosPresupuesto: (gastos - devoluciones) + transferenciasGasto,
+    neto: ingresos - (gastos - devoluciones),
     pendiente,
     vencido,
     evol,
@@ -2885,10 +2906,12 @@ function obtenerResumenEstablecimientos(anio, mes) {
   const periodo = a + '-' + String(m).padStart(2, '0');
 
   leerHoja('Transacciones')
-    .filter(t => String(t.fecha).slice(0, 7) === periodo && (t.tipo === 'gasto' || t.tipo === 'ingreso'))
+    .filter(t => String(t.fecha).slice(0, 7) === periodo && (t.tipo === 'gasto' || t.tipo === 'ingreso' || t.tipo === 'devolucion'))
     .forEach(t => {
       const fila = porId[String(t.establecimiento_id || '')] || porId[''];
-      fila[t.tipo === 'ingreso' ? 'ingresos' : 'gastos'] += Number(t.importe || 0);
+      if (t.tipo === 'ingreso') fila.ingresos += Number(t.importe || 0);
+      else if (t.tipo === 'gasto') fila.gastos += Number(t.importe || 0);
+      else if (t.tipo === 'devolucion') fila.gastos -= Number(t.importe || 0); // ponytail: revierten gasto
     });
   filas.forEach(f => { f.neto = f.ingresos - f.gastos; });
   return { anio: a, mes: m, filas: filas };
@@ -2897,7 +2920,7 @@ function obtenerResumenEstablecimientos(anio, mes) {
 function obtenerCategoriasResumen(anio, mes) {
   const a = anio || new Date().getFullYear();
   const m = mes || (new Date().getMonth() + 1);
-  const txs = leerHoja('Transacciones').filter(t => ['gasto', 'ingreso', 'transferencia'].includes(t.tipo));
+  const txs = leerHoja('Transacciones').filter(t => ['gasto', 'ingreso', 'transferencia', 'devolucion'].includes(t.tipo));
   const ps = filasVisibles_('Presupuestos');
   const cats = obtenerCategorias();
   const catsById = {};
@@ -2929,12 +2952,18 @@ function obtenerCategoriasResumen(anio, mes) {
   });
   return cats.map(c => {
     const esperado = ps.filter(p => p.categoria_id === c.id).reduce((s, p) => s + Number(p.importe_esperado || 0), 0);
+    // ponytail: devoluciones (importe positivo) restan del real de su categoría
+    // de gasto. Se cuentan junto al caso !transferencia para reutilizar el
+    // filtro por categoria_id y mes.
     const real = txs.filter(t => {
       if (t.tipo === 'transferencia') return false; // transferencias se cuentan por porCatRep
       if (t.categoria_id !== c.id) return false;
       const f = new Date(t.fecha);
       return f.getFullYear() === Number(a) && (f.getMonth() + 1) === Number(m);
-    }).reduce((s, t) => s + Number(t.importe || 0), 0) + (porCatRep[c.id] || 0);
+    }).reduce((s, t) => {
+      const imp = Number(t.importe || 0);
+      return s + (t.tipo === 'devolucion' ? -imp : imp);
+    }, 0) + (porCatRep[c.id] || 0);
     return { id: c.id, nombre: c.nombre, color: c.color, esperado, real, diferencia: real - esperado };
   });
 }
@@ -3359,6 +3388,36 @@ function __selfTestBody_(owner) {
   // Limpieza
   eliminarRecurrente(recIdOriginal);
   eliminarTransaccion(txRec.id);
+
+  // ponytail: smoke-test de devoluciones — verifica que la categoría de gasto
+  // queda como real = gasto_original − devolucion, y que el saldo de la cuenta
+  // recupera lo devuelto. Mismo mes para que el cálculo del resumen aplique.
+  const catGasto = cat.find(c => c.tipo === 'gasto');
+  const hoy = new Date();
+  const mesResumen = hoy.getFullYear() + '-' + String(hoy.getMonth() + 1).padStart(2, '0');
+  const txBase = guardarTransaccion({
+    tipo: 'gasto', importe: 50, cuenta_id: cuentas[0].id,
+    categoria_id: catGasto.id, descripcion: 'self-devol-base', fecha: isoHoy_()
+  });
+  const txDev = guardarTransaccion({
+    tipo: 'devolucion', importe: 20, cuenta_id: cuentas[0].id,
+    categoria_id: catGasto.id, descripcion: 'self-devol-rev', fecha: isoHoy_()
+  });
+  const categoriasMes = obtenerCategoriasResumen(hoy.getFullYear(), hoy.getMonth() + 1);
+  const realGasto = categoriasMes.find(r => r.id === catGasto.id).real;
+  if (realGasto !== 30) throw new Error('Devolución no restó del real: ' + realGasto);
+  const saldoTras = obtenerCuentas().find(c => c.id === cuentas[0].id).saldo;
+  const saldoEsperado = cuentas[0].saldo - 50 + 20;
+  if (Math.abs(saldoTras - saldoEsperado) > 0.01) {
+    throw new Error('Saldo tras devolución incorrecto: ' + saldoTras + ' vs ' + saldoEsperado);
+  }
+  // Y la categoría de ingreso no debe haberse tocado.
+  const resumenMes = obtenerResumen(hoy.getFullYear(), hoy.getMonth() + 1);
+  if (resumenMes.ingresos !== 0) throw new Error('Devolución no debe contar como ingreso');
+  if (resumenMes.gastos !== 30) throw new Error('Resumen gastos sin aplicar devolución: ' + resumenMes.gastos);
+  // Limpieza
+  eliminarTransaccion(txDev.id);
+  eliminarTransaccion(txBase.id);
 
   return 'ok ' + cuentas.length + ' cuentas, ' + cat.length + ' categorías, diferencia=' + conciliado.diferencia;
 }
