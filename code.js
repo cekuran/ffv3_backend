@@ -1729,29 +1729,35 @@ function obtenerCuentas() {
 
 // Variación de saldo que aporta una transacción a una cuenta concreta.
 function deltaCuenta_(t, cuentaId) {
+  // Devolución con destino: actúa como transferencia (sale del origen, entra al destino).
+  // Devolución sin destino: el origen recibe el importe (revierte un gasto de esa cuenta).
+  const devolConDestino = t.tipo === 'devolucion' && t.cuenta_destino_id;
   if (t.cuenta_id === cuentaId) {
+    if (devolConDestino) return -Number(t.importe || 0);
     if (t.tipo === 'ingreso' || t.tipo === 'devolucion') return Number(t.importe || 0);
     if (t.tipo === 'gasto' || t.tipo === 'transferencia') return -Number(t.importe || 0);
     return 0;
   }
-  if (t.cuenta_destino_id === cuentaId && t.tipo === 'transferencia') {
+  if (t.cuenta_destino_id === cuentaId && (t.tipo === 'transferencia' || t.tipo === 'devolucion')) {
     return Number(t.importe_destino || t.importe || 0);
   }
   return 0;
 }
 
 // Variación de saldo que aporta una transacción a una subcuenta concreta.
-// Gasto/ingreso usan subcuenta_id. Las transferencias restan de la subcuenta
-// de origen (subcuenta_id) y suman a la subcuenta de destino: si hay
-// reparto_destino (JSON con varias subcuentas) se reparte; si no, se usa el
-// legado subcuenta_destino_id único.
+// Gasto/ingreso usan subcuenta_id. Las transferencias y devoluciones con
+// destino restan de la subcuenta de origen (subcuenta_id) y suman a la de
+// destino: si hay reparto_destino (JSON con varias subcuentas) se reparte;
+// si no, se usa el legado subcuenta_destino_id único.
 function deltaSubcuenta_(t, subId) {
   let d = 0;
+  const devolConDestino = t.tipo === 'devolucion' && t.cuenta_destino_id;
   if (t.subcuenta_id === subId) {
-    if (t.tipo === 'ingreso' || t.tipo === 'devolucion') d += Number(t.importe || 0);
+    if (devolConDestino) d += -Number(t.importe || 0);
+    else if (t.tipo === 'ingreso' || t.tipo === 'devolucion') d += Number(t.importe || 0);
     else if (t.tipo === 'gasto' || t.tipo === 'transferencia') d += -Number(t.importe || 0);
   }
-  if (t.tipo === 'transferencia') {
+  if (t.tipo === 'transferencia' || t.tipo === 'devolucion') {
     const reparto = parseRepartoDestino_(t.reparto_destino);
     if (reparto.length) {
       const r = reparto.find(x => x.subcuenta_id === subId);
@@ -2240,8 +2246,20 @@ function guardarTransaccion(tx) {
       if (!subd) throw new Error('Subcuenta destino no encontrada o no pertenece a la cuenta destino');
       subcuenta_destino_id = tx.subcuenta_destino_id;
     }
-  } else if (tx.subcuenta_destino_id) {
-    throw new Error('Subcuenta destino solo aplica a transferencias');
+  } else if (tx.subcuenta_destino_id && tipo !== 'devolucion') {
+    throw new Error('Subcuenta destino solo aplica a transferencias o devoluciones con destino');
+  }
+  if ((tipo === 'transferencia' || tipo === 'devolucion') && tx.cuenta_destino_id) {
+    const dest = cuentasHoja.find(c => c.id === tx.cuenta_destino_id);
+    if (!dest) throw new Error('Cuenta destino no encontrada');
+    if (tipo === 'devolucion' && !tx.subcuenta_destino_id) {
+      // ponytail: devolucion con destino valida que la subcuenta destino
+      // pertenezca a la cuenta destino si viene informada. Sin reparto
+      // ni conversion: la devolucion es siempre 1:1.
+    } else if (tx.subcuenta_destino_id) {
+      const subd = cuentasHoja.find(c => c.id === tx.subcuenta_destino_id && c.parent_id === tx.cuenta_destino_id);
+      if (!subd) throw new Error('Subcuenta destino no pertenece a la cuenta destino');
+    }
   }
   if (tipo === 'transferencia') {
     const cuentasById = {};
@@ -3418,6 +3436,29 @@ function __selfTestBody_(owner) {
   // Limpieza
   eliminarTransaccion(txDev.id);
   eliminarTransaccion(txBase.id);
+
+  // ponytail: smoke-test de devolucion con destino (pasivo → activo).
+  // Verifica que el origen resta y el destino suma, sin tocar ingresos.
+  const ctaPasivo = cuentas.find(c => c.tipo === 'pasivo');
+  const ctaActivo = cuentas.find(c => c.tipo === 'activo' && c.id !== cuentas[0].id) || cuentas[0];
+  if (ctaPasivo) {
+    const saldoPasivoAntes = obtenerCuentas().find(c => c.id === ctaPasivo.id).saldo;
+    const saldoActivoAntes = obtenerCuentas().find(c => c.id === ctaActivo.id).saldo;
+    const txDevDest = guardarTransaccion({
+      tipo: 'devolucion', importe: 15, cuenta_id: ctaPasivo.id,
+      cuenta_destino_id: ctaActivo.id,
+      categoria_id: catGasto.id, descripcion: 'self-devol-dest', fecha: isoHoy_()
+    });
+    const saldoPasivoDesp = obtenerCuentas().find(c => c.id === ctaPasivo.id).saldo;
+    const saldoActivoDesp = obtenerCuentas().find(c => c.id === ctaActivo.id).saldo;
+    if (Math.abs((saldoPasivoDesp - saldoPasivoAntes) - (-15)) > 0.01) {
+      throw new Error('Devolución con destino no restó al origen pasivo: ' + (saldoPasivoDesp - saldoPasivoAntes));
+    }
+    if (Math.abs((saldoActivoDesp - saldoActivoAntes) - 15) > 0.01) {
+      throw new Error('Devolución con destino no sumó al destino activo: ' + (saldoActivoDesp - saldoActivoAntes));
+    }
+    eliminarTransaccion(txDevDest.id);
+  }
 
   return 'ok ' + cuentas.length + ' cuentas, ' + cat.length + ' categorías, diferencia=' + conciliado.diferencia;
 }
