@@ -1,0 +1,4 @@
+*.md
+.git/**
+*.bak
+.gitignore
