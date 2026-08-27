@@ -1661,13 +1661,18 @@ function obtenerCuentas() {
     const subcuentas = subs.map(s => {
       const subInitial = Number(s.saldo_inicial || 0);
       // Cuenta como movimiento de la subcuenta cuando es su origen (cuenta_id)
-      // o el destino de una transferencia (cuenta_destino_id o reparto_destino).
-      // En ambos casos la cuenta implicada debe ser este mismo padre.
+      // o el destino de una transferencia/devolución (cuenta_destino_id o
+      // reparto_destino). En ambos casos la cuenta implicada debe ser este
+      // mismo padre.
       const subDelta = txs
         .filter(t => {
           const origenOk = t.subcuenta_id === s.id && t.cuenta_id === c.id;
           if (origenOk) return true;
-          if (t.cuenta_destino_id !== c.id || t.tipo !== 'transferencia') return false;
+          // ponytail: devoluciones con destino también imputan a la subcuenta
+          // destino (deltaSubcuenta_ ya las soporta); excluirlas aquí hacía
+          // que ni la API ni una edición manual en el sheet actualizasen el
+          // saldo de la subcuenta destino.
+          if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
           const reparto = parseRepartoDestino_(t.reparto_destino);
           if (reparto.length) return reparto.some(r => r.subcuenta_id === s.id);
           return t.subcuenta_destino_id === s.id;
@@ -1701,7 +1706,9 @@ function obtenerCuentas() {
             const fechaOk = String(t.fecha).slice(0, 7) <= k;
             if (!fechaOk) return false;
             if (t.subcuenta_id === sub.id && t.cuenta_id === c.id) return true;
-            if (t.cuenta_destino_id !== c.id || t.tipo !== 'transferencia') return false;
+            // ponytail: mismo caso que arriba — devoluciones con destino
+            // también imputan a la subcuenta destino en la evolución mensual.
+            if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
             const reparto = parseRepartoDestino_(t.reparto_destino);
             if (reparto.length) return reparto.some(r => r.subcuenta_id === sub.id);
             return t.subcuenta_destino_id === sub.id;
@@ -2246,6 +2253,13 @@ function guardarTransaccion(tx) {
       if (!subd) throw new Error('Subcuenta destino no encontrada o no pertenece a la cuenta destino');
       subcuenta_destino_id = tx.subcuenta_destino_id;
     }
+  } else if (tipo === 'devolucion' && tx.cuenta_destino_id && tx.subcuenta_destino_id) {
+    // ponytail: devolucion con destino 1:1 también persiste subcuenta_destino_id
+    // (no hay reparto ni conversion; la UI solo lo ofrece si ctaDest tiene
+    // subcuentas, pero el campo puede llegar desde una edición manual).
+    const subd = cuentasHoja.find(c => c.id === tx.subcuenta_destino_id && c.parent_id === tx.cuenta_destino_id);
+    if (!subd) throw new Error('Subcuenta destino no encontrada o no pertenece a la cuenta destino');
+    subcuenta_destino_id = tx.subcuenta_destino_id;
   } else if (tx.subcuenta_destino_id && tipo !== 'devolucion') {
     throw new Error('Subcuenta destino solo aplica a transferencias o devoluciones con destino');
   }
@@ -3458,6 +3472,33 @@ function __selfTestBody_(owner) {
       throw new Error('Devolución con destino no sumó al destino activo: ' + (saldoActivoDesp - saldoActivoAntes));
     }
     eliminarTransaccion(txDevDest.id);
+
+    // ponytail: regresión — devolucion con destino y subcuenta_destino debe
+    // persistir el subcuenta_destino_id en la fila y atribuir el saldo a esa
+    // subcuenta destino (no a la cuenta padre). Antes el backend rechazaba
+    // silenciosamente el campo, así que la suma caía en el padre y la
+    // subcuenta quedaba desfasada aunque se editara manualmente en el sheet.
+    const destSubName = 'self-devoldest-sub-' + Utilities.getUuid().slice(0, 8);
+    const withDestSub = guardarCuenta({
+      parent_id: ctaActivo.id, nombre: destSubName, saldo_inicial: 0
+    });
+    const destSubId = withDestSub.find(c => c.id === ctaActivo.id)
+      .subcuentas.find(s => s.nombre === destSubName).id;
+    const txDevSub = guardarTransaccion({
+      tipo: 'devolucion', importe: 25, cuenta_id: ctaPasivo.id,
+      cuenta_destino_id: ctaActivo.id, subcuenta_destino_id: destSubId,
+      categoria_id: catGasto.id, descripcion: 'self-devol-dest-sub', fecha: isoHoy_()
+    });
+    if (!txDevSub.subcuenta_destino_id || txDevSub.subcuenta_destino_id !== destSubId) {
+      throw new Error('Devolución no persistió subcuenta_destino_id: ' + txDevSub.subcuenta_destino_id);
+    }
+    const subSaldo = obtenerCuentas().find(c => c.id === ctaActivo.id)
+      .subcuentas.find(s => s.id === destSubId).saldo;
+    if (Math.abs(subSaldo - 25) > 0.01) {
+      throw new Error('Devolución no imputó a subcuenta destino: ' + subSaldo);
+    }
+    eliminarTransaccion(txDevSub.id);
+    eliminarCuenta(destSubId);
   }
 
   return 'ok ' + cuentas.length + ' cuentas, ' + cat.length + ' categorías, diferencia=' + conciliado.diferencia;
