@@ -10,7 +10,8 @@ const SCHEMA = {
   Recurrentes:   ['owner','id','plantilla','ultima_generacion','activa','mes_inicio','anio_inicio'],
   Presupuestos:  ['owner','id','anio','mes','categoria_id','importe_esperado'],
   Conciliaciones:['owner','id','fecha','cuenta_id','saldo_sistema','saldo_banco','diferencia','notas'],
-  TiposCambio:   ['owner','id','fecha','base','destino','ratio']
+  TiposCambio:   ['owner','id','fecha','base','destino','ratio'],
+  Snapshots:     ['owner','id','fecha_fin','scope','scope_id','saldo','fecha_creacion']
 };
 
 const AUTH_SCHEMA = {
@@ -1129,7 +1130,33 @@ function migrarEsquema() {
     SCHEMA[nombre].forEach((col, i) => {
       if (!cabPost.includes(col)) h.getRange(1, Math.max(h.getLastColumn(), i) + 1).setValue(col);
     });
+    // ponytail: si las columnas quedaron en otro orden que el SCHEMA (caso
+    // típico: hoja migrada desde un schema viejo donde columnas nuevas se
+    // APPENDEARON al final), reordenar para alinear con SCHEMA. Sin esto,
+    // upsertFila tiene que escribir por el orden del sheet y futuros cambios
+    // de schema seguirían requiriendo lógica especial de lectura.
+    const schema = SCHEMA[nombre];
+    const finalCab = h.getRange(1, 1, 1, h.getLastColumn()).getValues()[0];
+    const sameOrder = finalCab.length === schema.length && schema.every((c, i) => finalCab[i] === c);
+    if (!sameOrder) reordenarColumnasSegunSchema_(h, finalCab, schema, nombre);
   });
+}
+
+// Reordena las columnas de una hoja para que coincidan con el orden del
+// SCHEMA, preservando los datos existentes. Si el sheet no tiene alguna
+// columna del SCHEMA (no debería pasar tras la fase de append previa), esa
+// columna se rellena con vacío.
+function reordenarColumnasSegunSchema_(h, currentCab, schema, nombre) {
+  const valores = h.getDataRange().getValues();
+  const header = valores[0] || currentCab;
+  const dataRows = valores.slice(1);
+  const idxMap = schema.map(c => header.indexOf(c));
+  const reordenadas = dataRows.map(fila => idxMap.map(i => (i >= 0 && i < fila.length) ? fila[i] : ''));
+  h.clearContents();
+  h.getRange(1, 1, 1, schema.length).setValues([schema]).setFontWeight('bold');
+  h.setFrozenRows(1);
+  if (reordenadas.length) h.getRange(2, 1, reordenadas.length, schema.length).setValues(reordenadas);
+  invalidateSheetCache_(nombre);
 }
 
 // Sheets convierte automáticamente las fechas en formato texto ('yyyy-MM-dd')
@@ -1238,6 +1265,213 @@ function bumpDataVersion_(sheetId) {
   } catch (e) { /* best-effort */ }
   _dataVersionMem[id] = v;
   return v;
+}
+
+// ───────── Snapshots mensuales de saldos ─────────
+// Cada fila es el saldo de un scope (cuenta o subcuenta) al cierre de un mes
+// (fecha_fin = último día del mes). Sirven como "punto de referencia" para no
+// tener que recorrer todas las transacciones desde el inicio del historial
+// cada vez que se piden saldos.
+//
+// Anchura: leer el MAX(fecha_fin) por scope (el "anchor") y sumar solo las
+// transacciones con fecha > anchor. La pantalla del usuario es
+// anchor.saldo + delta_post_anchor. Para los meses del histórico se sirve
+// directamente desde el snapshot correspondiente (si existe).
+//
+// Reglas de actualización:
+//   - generar: lazy al entrar a obtenerCuentas si el anchor está más viejo
+//     que el último mes cerrado.
+//   - ajustar: cada guardar/eliminar transacción aplica el delta del cambio
+//     a TODOS los snapshots con fecha_fin >= tx.fecha (porque ese tx habría
+//     estado incluido en ellos).
+const SNAPSHOT_SHEET = 'Snapshots';
+
+function leerSnapshots_() {
+  if (_sheetReadCache[SNAPSHOT_SHEET]) return cloneRows_(_sheetReadCache[SNAPSHOT_SHEET]);
+  const h = ssActiva_().getSheetByName(SNAPSHOT_SHEET);
+  if (!h) {
+    _sheetReadCache[SNAPSHOT_SHEET] = [];
+    return [];
+  }
+  const valores = h.getDataRange().getValues();
+  if (valores.length < 2) {
+    _sheetReadCache[SNAPSHOT_SHEET] = [];
+    return [];
+  }
+  const cab = valores[0];
+  const rows = valores.slice(1).map(fila => {
+    const o = {};
+    cab.forEach((k, i) => (o[k] = normalizarValor_(fila[i])));
+    return o;
+  });
+  _sheetReadCache[SNAPSHOT_SHEET] = rows;
+  return cloneRows_(rows);
+}
+
+function escribirSnapshots_(filas) {
+  asegurarHoja(SNAPSHOT_SHEET);
+  const h = ssActiva_().getSheetByName(SNAPSHOT_SHEET);
+  const cab = SCHEMA[SNAPSHOT_SHEET];
+  h.clearContents();
+  const filasSafe = filas || [];
+  const matriz = [cab].concat(filasSafe.map(f => cab.map(k => f[k] != null ? f[k] : '')));
+  if (matriz.length) h.getRange(1, 1, matriz.length, cab.length).setValues(matriz);
+  h.setFrozenRows(1);
+  _sheetReadCache[SNAPSHOT_SHEET] = cloneRows_(filasSafe);
+}
+
+// Devuelve el último día del mes anterior a fechaIso (yyyy-MM-dd).
+function finMesAnterior_(fechaIso) {
+  const d = parseFecha(fechaIso) || new Date();
+  return iso_(new Date(d.getFullYear(), d.getMonth(), 0));
+}
+
+// Genera snapshots para una lista de cierres (yyyy-MM-dd) en orden ascendente.
+// Recorre las transacciones una sola vez y va acumulando el saldo por scope;
+// para cada cierre emite una fila de snapshot. Coste: O(N + M*S), mejor que
+// la ruta legacy O(M*N*S). Si el rango ya tiene snapshots, los reemplaza.
+function generarSnapshotsParaFechas_(fechaFins) {
+  if (!fechaFins || !fechaFins.length) return;
+  const cuentas = filasVisibles_('Cuentas');
+  if (!cuentas.length) return;
+  const top = cuentas.filter(c => !c.parent_id).sort((a, b) => Number(a.orden || 99) - Number(b.orden || 99));
+  if (!top.length) return;
+
+  const scopes = [];
+  top.forEach(c => {
+    scopes.push({
+      scope: 'cuenta', scope_id: c.id,
+      saldo: Number(c.saldo_inicial || 0)
+    });
+    cuentas.filter(s => s.parent_id === c.id).forEach(s => {
+      scopes.push({
+        scope: 'subcuenta', scope_id: s.id,
+        saldo: Number(s.saldo_inicial || 0)
+      });
+    });
+  });
+
+  const txs = leerHoja('Transacciones').slice()
+    .sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+  const fechasSorted = fechaFins.slice().sort();
+
+  const existing = leerSnapshots_();
+  const setFechas = new Set(fechasSorted);
+  const keep = existing.filter(s => !setFechas.has(String(s.fecha_fin)));
+
+  const nuevas = [];
+  let txIdx = 0;
+  fechasSorted.forEach(me => {
+    while (txIdx < txs.length && String(txs[txIdx].fecha) <= me) {
+      const t = txs[txIdx];
+      scopes.forEach(sk => {
+        sk.saldo += sk.scope === 'cuenta'
+          ? deltaCuenta_(t, sk.scope_id)
+          : deltaSubcuenta_(t, sk.scope_id);
+      });
+      txIdx++;
+    }
+    scopes.forEach(sk => {
+      nuevas.push({
+        owner: '',
+        id: uid_('snap'),
+        fecha_fin: me,
+        scope: sk.scope,
+        scope_id: sk.scope_id,
+        saldo: Number(sk.saldo.toFixed(2)),
+        fecha_creacion: isoAhora_()
+      });
+    });
+  });
+
+  escribirSnapshots_([...keep, ...nuevas]);
+}
+
+// Asegura que existe snapshot para el último mes cerrado. Si el anchor (último
+// snapshot por fecha_fin) es anterior al cierre esperado, genera los cierres
+// que faltan. Cuando no hay ningún snapshot, usa la fecha de la transacción
+// más antigua como inicio (si hay) o el propio cierre esperado si no.
+function asegurarSnapshotsAlDia_() {
+  const fechaFinSugerida = finMesAnterior_(isoHoy_());
+  const existing = leerSnapshots_();
+  if (existing.some(s => String(s.fecha_fin) === fechaFinSugerida)) return;
+
+  const txs = leerHoja('Transacciones');
+  const fechasTxs = txs.map(t => String(t.fecha)).filter(Boolean).sort();
+  let primeraFecha = fechasTxs[0] || fechaFinSugerida;
+
+  // Si la primera transacción cae en el mes actual (o posterior), todavía no
+  // hay un rango que cubrir: generamos sólo el anchor del último mes cerrado.
+  const target = parseFecha(fechaFinSugerida);
+  const inicioMes = parseFecha(primeraFecha);
+  const inicioMesFin = new Date(inicioMes.getFullYear(), inicioMes.getMonth() + 1, 0);
+
+  if (inicioMesFin > target) {
+    if (existing.some(s => String(s.fecha_fin) === fechaFinSugerida)) return;
+    generarSnapshotsParaFechas_([fechaFinSugerida]);
+    return;
+  }
+
+  const fechasSet = new Set(existing.map(s => String(s.fecha_fin)));
+  const aGenerar = [];
+  let cursor = new Date(inicioMesFin.getFullYear(), inicioMesFin.getMonth(), 1);
+  while (cursor <= target) {
+    const me = iso_(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0));
+    if (!fechasSet.has(me)) aGenerar.push(me);
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+  }
+  if (aGenerar.length) generarSnapshotsParaFechas_(aGenerar);
+}
+
+// Scopes cuyo saldo se ve afectado por una transacción (origen/destino y sus
+// subcuentas, incluyendo el reparto). Se devuelve como strings "scope:scope_id".
+function scopesAfectadosPorTx_(t) {
+  if (!t) return [];
+  const out = ['cuenta:' + t.cuenta_id];
+  if (t.cuenta_destino_id) out.push('cuenta:' + t.cuenta_destino_id);
+  if (t.subcuenta_id) out.push('subcuenta:' + t.subcuenta_id);
+  const reparto = parseRepartoDestino_(t.reparto_destino);
+  if (reparto.length) {
+    reparto.forEach(r => out.push('subcuenta:' + r.subcuenta_id));
+  } else if (t.subcuenta_destino_id) {
+    out.push('subcuenta:' + t.subcuenta_destino_id);
+  }
+  return out;
+}
+
+// Devuelve el delta que una tx aporta a un scope concreto.
+function deltaScope_(t, scope, scopeId) {
+  if (!t) return 0;
+  return scope === 'cuenta'
+    ? deltaCuenta_(t, scopeId)
+    : deltaSubcuenta_(t, scopeId);
+}
+
+// Aplica el cambio de una tx (alta, edición o baja) sobre todos los snapshots
+// cuyo fecha_fin sea >= tx.fecha. La edición es la composición de -vieja + nueva.
+function ajustarSnapshotsPorCambioTx_(txAnterior, txNuevo) {
+  const snapshots = leerSnapshots_();
+  if (!snapshots.length) return;
+
+  const aplicar = (t, signo) => {
+    if (!t) return;
+    const txFecha = String(t.fecha || '');
+    if (!txFecha) return;
+    const affected = scopesAfectadosPorTx_(t);
+    const affectedSet = new Set(affected);
+    snapshots.forEach(snap => {
+      if (String(snap.fecha_fin) < txFecha) return;
+      const key = snap.scope + ':' + snap.scope_id;
+      if (!affectedSet.has(key)) return;
+      const d = deltaScope_(t, snap.scope, snap.scope_id);
+      snap.saldo = Number((Number(snap.saldo || 0) + signo * d).toFixed(2));
+    });
+  };
+
+  aplicar(txAnterior, -1);
+  aplicar(txNuevo, +1);
+
+  escribirSnapshots_(snapshots);
 }
 
 // ponytail: scope por spreadsheetId + usuario + data_version. Permite que dos
@@ -1384,17 +1618,23 @@ function upsertFila(nombre, fila) {
   if (!cab) throw new Error('Hoja desconocida: ' + nombre);
   const nCols = cab.length;
   const idx = datos.findIndex(f => f.id === fila.id);
+  // ponytail: escribir por el orden real de columnas del sheet, no por el
+  // SCHEMA. migrarEsquema sólo APPENDEA columnas nuevas al final, así que
+  // hojas migradas desde un schema viejo pueden tenerlas en otro orden que
+  // el actual (p.ej. Cuentas: fecha_creacion antes que establecimiento_id).
+  // Escribir por SCHEMA en esos casos machaca la celda equivocada.
+  const h = ssActiva_().getSheetByName(nombre);
+  const sheetCab = h.getRange(1, 1, 1, h.getLastColumn()).getValues()[0];
+  const writeCols = sheetCab.length || nCols;
+  const valores = sheetCab.map(k => fila[k] != null ? fila[k] : '');
   if (idx >= 0) {
     fila = Object.assign({}, datos[idx], fila, { owner: datos[idx].owner });
     datos[idx] = fila;
-    const h = ssActiva_().getSheetByName(nombre);
     // Fila de datos en sheet = idx + 2 (cabecera en 1)
     const rowNum = idx + 2;
-    const valores = cab.map(k => fila[k] != null ? fila[k] : '');
-    h.getRange(rowNum, 1, 1, nCols).setValues([valores]);
+    h.getRange(rowNum, 1, 1, writeCols).setValues([valores]);
   } else {
     datos.push(fila);
-    const h = ssActiva_().getSheetByName(nombre);
     const last = h.getLastRow();
     // Si la hoja está vacía o solo tiene cabecera parcial, asegurar cabecera.
     if (last < 1) {
@@ -1402,8 +1642,7 @@ function upsertFila(nombre, fila) {
       h.setFrozenRows(1);
     }
     const rowNum = Math.max(last, 1) + 1;
-    const valores = cab.map(k => fila[k] != null ? fila[k] : '');
-    h.getRange(rowNum, 1, 1, nCols).setValues([valores]);
+    h.getRange(rowNum, 1, 1, writeCols).setValues([valores]);
   }
   _sheetReadCache[nombre] = cloneRows_(datos);
   if (nombre === 'Cuentas' || nombre === 'Transacciones') {
@@ -1612,6 +1851,14 @@ function incluir(html) { return HtmlService.createHtmlOutputFromFile(html).getCo
 // ───────── Cuentas ─────────
 function obtenerCuentas() {
   const sheetId = sheetIdParaCache_();
+  // ponytail: snapshots mensuales. El anchor es el último cierre generado
+  // (fecha_fin = último día del mes más reciente ya cerrado). Los saldos
+  // mostrados son anchor + deltas de las transacciones con fecha > anchor,
+  // así evitamos recorrer todo el historial en cada llamada. Para los meses
+  // del histórico servimos directamente desde el snapshot cuando existe.
+  // Se llama ANTES del cache check para que el primer request tras desplegar
+  // pueble los snapshots incluso si hay un cache previo "legacy".
+  asegurarSnapshotsAlDia_();
   // 1) Memoria de la request (bootstrap llama obtenerCuentas varias veces).
   if (_cuentasComputedCache && _cuentasComputedSheetId === sheetId) {
     return cloneCuentasComputed_(_cuentasComputedCache);
@@ -1630,25 +1877,36 @@ function obtenerCuentas() {
   const cuentas = filasVisibles_('Cuentas').filter(c => !c.oculta);
   const txs = leerHoja('Transacciones');
   const fmtMes = d => Utilities.formatDate(d, tz_(), 'yyyy-MM');
+  const snapshots = leerSnapshots_();
+  const snapByKey = {}; // 'YYYY-MM-DD|scope:scope_id' -> saldo
+  let anchorFechaFin = '';
+  snapshots.forEach(s => {
+    snapByKey[String(s.fecha_fin) + '|' + s.scope + ':' + s.scope_id] = Number(s.saldo || 0);
+    if (String(s.fecha_fin) > anchorFechaFin) anchorFechaFin = String(s.fecha_fin);
+  });
+  const liveTxs = anchorFechaFin ? txs.filter(t => String(t.fecha) > anchorFechaFin) : txs;
 
   const top = cuentas.filter(c => !c.parent_id).sort((a, b) => Number(a.orden || 99) - Number(b.orden || 99));
   const result = top.map(c => {
     const subs = cuentas.filter(x => x.parent_id === c.id);
     const subIds = new Set(subs.map(x => x.id));
     const parentInitial = Number(c.saldo_inicial || 0);
+    const subInitialTotal = subs.reduce((s, x) => s + Number(x.saldo_inicial || 0), 0);
+    // ponytail: si no hay snapshot del scope (cuenta recién creada o sin
+    // historial), caemos al saldo inicial para que no se quede a 0 antes
+    // del primer cierre de mes.
+    const anchorCuenta = snapByKey[anchorFechaFin + '|cuenta:' + c.id];
+    const anchorCuentaSaldo = anchorCuenta != null ? anchorCuenta : parentInitial + subInitialTotal;
 
-    // Txs del padre: golpean esta cuenta y NO están asignadas a una subcuenta
-    // propia de esta cuenta (ni como origen ni como destino de transferencia).
+    // Txs del padre (sólo las post-anchor; las anteriores ya están en el snapshot).
     // Una subcuenta "huérfana" (de otra cuenta) se trata como movimiento del
     // padre, no se atribuye a la cuenta ajena.
-    const parentTxs = txs.filter(t => {
+    const parentTxs = liveTxs.filter(t => {
       const origen = t.cuenta_id === c.id;
       const destino = t.cuenta_destino_id === c.id;
       if (!origen && !destino) return false;
       if (origen && t.subcuenta_id && subIds.has(t.subcuenta_id)) return false;
       if (destino) {
-        // Cualquier subcuenta del reparto que sea hija de este padre cuenta
-        // como sub-tx (no como tx del padre).
         const reparto = parseRepartoDestino_(t.reparto_destino);
         const subDest = reparto.length
           ? reparto.map(r => r.subcuenta_id)
@@ -1660,36 +1918,37 @@ function obtenerCuentas() {
 
     const subcuentas = subs.map(s => {
       const subInitial = Number(s.saldo_inicial || 0);
-      // Cuenta como movimiento de la subcuenta cuando es su origen (cuenta_id)
-      // o el destino de una transferencia/devolución (cuenta_destino_id o
-      // reparto_destino). En ambos casos la cuenta implicada debe ser este
-      // mismo padre.
-      const subDelta = txs
+      // ponytail: devoluciones con destino también imputan a la subcuenta
+      // destino (deltaSubcuenta_ ya las soporta); excluirlas aquí hacía
+      // que ni la API ni una edición manual en el sheet actualizasen el
+      // saldo de la subcuenta destino.
+      const subDelta = liveTxs
         .filter(t => {
           const origenOk = t.subcuenta_id === s.id && t.cuenta_id === c.id;
           if (origenOk) return true;
-          // ponytail: devoluciones con destino también imputan a la subcuenta
-          // destino (deltaSubcuenta_ ya las soporta); excluirlas aquí hacía
-          // que ni la API ni una edición manual en el sheet actualizasen el
-          // saldo de la subcuenta destino.
           if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
           const reparto = parseRepartoDestino_(t.reparto_destino);
           if (reparto.length) return reparto.some(r => r.subcuenta_id === s.id);
           return t.subcuenta_destino_id === s.id;
         })
         .reduce((sum, t) => sum + deltaSubcuenta_(t, s.id), 0);
+      const anchorSub = snapByKey[anchorFechaFin + '|subcuenta:' + s.id];
+      const anchorSubSaldo = anchorSub != null ? anchorSub : subInitial;
       return {
         id: s.id, nombre: s.nombre, parent_id: c.id,
         saldo_inicial: subInitial,
-        saldo: subInitial + subDelta,
+        saldo: anchorSubSaldo + subDelta,
         orden: Number(s.orden || 99)
       };
     }).sort((a, b) => a.orden - b.orden);
 
-    // Modelo aditivo: el saldo del padre es su propio saldo más el saldo
-    // completo de cada subcuenta (saldo_inicial + delta de transacciones).
-    const subTotal = subcuentas.reduce((s, x) => s + x.saldo, 0);
-    const subInitialTotal = subcuentas.reduce((s, x) => s + x.saldo_inicial, 0);
+    // Saldo del padre = anchor del padre + deltas post-anchor (parentTxs + deltas de subcuentas en live).
+    let subDeltaLive = 0;
+    subcuentas.forEach(x => {
+      const aVal = snapByKey[anchorFechaFin + '|subcuenta:' + x.id];
+      const anchorForX = aVal != null ? aVal : Number(x.saldo_inicial || 0);
+      subDeltaLive += x.saldo - anchorForX;
+    });
     const parentDelta = parentTxs.reduce((s, t) => s + deltaCuenta_(t, c.id), 0);
 
     const hoy = new Date();
@@ -1697,32 +1956,40 @@ function obtenerCuentas() {
     for (let i = 11; i >= 0; i--) {
       const d = new Date(hoy.getFullYear(), hoy.getMonth() - i, 1);
       const k = fmtMes(d);
-      const parentDeltaK = parentTxs
-        .filter(t => String(t.fecha).slice(0, 7) <= k)
-        .reduce((s, t) => s + deltaCuenta_(t, c.id), 0);
-      const subDeltaK = subcuentas.reduce((s, sub) => {
-        const dK = txs
-          .filter(t => {
-            const fechaOk = String(t.fecha).slice(0, 7) <= k;
-            if (!fechaOk) return false;
-            if (t.subcuenta_id === sub.id && t.cuenta_id === c.id) return true;
-            // ponytail: mismo caso que arriba — devoluciones con destino
-            // también imputan a la subcuenta destino en la evolución mensual.
-            if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
-            const reparto = parseRepartoDestino_(t.reparto_destino);
-            if (reparto.length) return reparto.some(r => r.subcuenta_id === sub.id);
-            return t.subcuenta_destino_id === sub.id;
-          })
-          .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id), 0);
-        return s + dK;
-      }, 0);
-      evolucion.push({ mes: k, saldo: parentInitial + parentDeltaK + subInitialTotal + subDeltaK });
+      const lastDayK = iso_(new Date(d.getFullYear(), d.getMonth() + 1, 0));
+      const snapKey = lastDayK + '|cuenta:' + c.id;
+      const snapSaldo = snapByKey[snapKey];
+      if (snapSaldo !== undefined) {
+        // Mes cerrado: servimos directo desde snapshot.
+        evolucion.push({ mes: k, saldo: snapSaldo });
+      } else {
+        // Mes en curso o sin snapshot todavía: anchor + deltas live hasta lastDayK.
+        const parentDeltaK = parentTxs
+          .filter(t => String(t.fecha) <= lastDayK)
+          .reduce((s, t) => s + deltaCuenta_(t, c.id), 0);
+        const subDeltaK = subcuentas.reduce((s, sub) => {
+          const anchorSubForK = snapByKey[anchorFechaFin + '|subcuenta:' + sub.id];
+          const base = anchorSubForK != null ? anchorSubForK : Number(sub.saldo_inicial || 0);
+          const live = liveTxs
+            .filter(t => {
+              if (String(t.fecha) > lastDayK) return false;
+              if (t.subcuenta_id === sub.id && t.cuenta_id === c.id) return true;
+              if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
+              const reparto = parseRepartoDestino_(t.reparto_destino);
+              if (reparto.length) return reparto.some(r => r.subcuenta_id === sub.id);
+              return t.subcuenta_destino_id === sub.id;
+            })
+            .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id), 0);
+          return s + (base + live - sub.saldo_inicial);
+        }, 0);
+        evolucion.push({ mes: k, saldo: anchorCuentaSaldo + parentDeltaK + subDeltaK });
+      }
     }
 
     return {
       id: c.id, nombre: c.nombre, tipo: c.tipo, moneda: c.moneda, icono: c.icono, establecimiento_id: c.establecimiento_id || '',
       saldo_inicial: parentInitial,
-      saldo: parentInitial + parentDelta + subTotal,
+      saldo: anchorCuentaSaldo + parentDelta + subDeltaLive,
       evolucion,
       subcuentas
     };
@@ -2340,6 +2607,13 @@ function guardarTransaccion(tx) {
     throw new Error('Falta importe destino o ratio de conversión');
   }
   upsertFila('Transacciones', fila);
+  // ponytail: ajustar snapshots mensuales al cambio. Si la fecha de la tx
+  // cae en o antes de algún snapshot.fecha_fin, ese snapshot llevaba la tx
+  // "incluida" y debe reflejar el delta. Para altas nuevas sólo se suma; para
+  // ediciones se resta la versión previa y se suma la nueva; los borrados
+  // van por eliminarTransaccion. También cubre el caso de mover una tx desde
+  // el rango live al pasado: su delta abandona el live y se incorpora al anchor.
+  ajustarSnapshotsPorCambioTx_(existente, fila);
   // ponytail: si la tx ya está vinculada a un recurrente, actualizar ese en
   // lugar de crear uno nuevo. Mantiene las txs generadas previas apuntando al
   // mismo id.
@@ -2439,6 +2713,10 @@ function eliminarTransaccion(id, baseFechaUltimaEdicion) {
     }
   }
   eliminarFila('Transacciones', id);
+  // ponytail: restar el delta de la tx borrada de los snapshots que la
+  // incluían (fecha_fin >= tx.fecha), para que el saldo "anclado" siga
+  // representando el estado correcto sin la tx eliminada.
+  ajustarSnapshotsPorCambioTx_(existente, null);
   return { ok: true, data_version: getDataVersion_() };
 }
 
@@ -3499,6 +3777,41 @@ function __selfTestBody_(owner) {
     }
     eliminarTransaccion(txDevSub.id);
     eliminarCuenta(destSubId);
+  }
+
+  // ponytail: smoke-test de snapshots mensuales. Verifica que añadir o borrar
+  // una transacción con fecha anterior al anchor ajusta el saldo mostrado
+  // exactamente como si sumásemos deltas de todas las tx desde el inicio
+  // (es decir, la corrección retroactiva que pide el usuario).
+  const ctaSnap = cuentas[0];
+  const antesSnap = obtenerCuentas().find(c => c.id === ctaSnap.id).saldo;
+  const txSnapPasado = guardarTransaccion({
+    tipo: 'gasto', importe: 3, cuenta_id: ctaSnap.id,
+    categoria_id: cat[0].id, descripcion: 'self-snap-pasado', fecha: '2020-01-15'
+  });
+  const despuesSnap = obtenerCuentas().find(c => c.id === ctaSnap.id).saldo;
+  if (Math.abs((antesSnap - despuesSnap) - 3) > 0.01) {
+    throw new Error('Snapshot no aplicó delta retroactivo: antes=' + antesSnap + ' despues=' + despuesSnap);
+  }
+  const snapsTrasAlta = leerSnapshots_().filter(s => s.scope_id === ctaSnap.id);
+  if (!snapsTrasAlta.length) throw new Error('No se generaron snapshots para la cuenta');
+  // Edición: cambiamos la fecha de pasado a "hoy" para arrastrar el delta fuera del anchor.
+  const txSnapEdit = guardarTransaccion({
+    id: txSnapPasado.id,
+    tipo: 'gasto', importe: 3, cuenta_id: ctaSnap.id,
+    categoria_id: cat[0].id, descripcion: 'self-snap-pasado', fecha: isoHoy_()
+  });
+  const despuesEdit = obtenerCuentas().find(c => c.id === ctaSnap.id).saldo;
+  // Como la tx sigue restando 3, el saldo debe quedar igual que tras el alta
+  // (sólo cambió de mes, no de impacto).
+  if (Math.abs(despuesEdit - despuesSnap) > 0.01) {
+    throw new Error('Edición cruzando el anchor movió saldo de más: edit=' + despuesEdit + ' alta=' + despuesSnap);
+  }
+  // Borrado: vuelve al saldo original.
+  eliminarTransaccion(txSnapEdit.id);
+  const restaurado = obtenerCuentas().find(c => c.id === ctaSnap.id).saldo;
+  if (Math.abs(restaurado - antesSnap) > 0.01) {
+    throw new Error('Borrado no restauró saldo del anchor: restaurado=' + restaurado + ' antes=' + antesSnap);
   }
 
   return 'ok ' + cuentas.length + ' cuentas, ' + cat.length + ' categorías, diferencia=' + conciliado.diferencia;
