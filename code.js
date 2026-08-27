@@ -1892,11 +1892,22 @@ function obtenerCuentas() {
     const subIds = new Set(subs.map(x => x.id));
     const parentInitial = Number(c.saldo_inicial || 0);
     const subInitialTotal = subs.reduce((s, x) => s + Number(x.saldo_inicial || 0), 0);
-    // ponytail: si no hay snapshot del scope (cuenta recién creada o sin
-    // historial), caemos al saldo inicial para que no se quede a 0 antes
-    // del primer cierre de mes.
-    const anchorCuenta = snapByKey[anchorFechaFin + '|cuenta:' + c.id];
-    const anchorCuentaSaldo = anchorCuenta != null ? anchorCuenta : parentInitial + subInitialTotal;
+    // ponytail: el snapshot guarda el saldo del padre y el de cada subcuenta
+    // por separado. El "saldo total" del padre (lo que muestra la UI) es
+    // snap_padre + Σ snap_sub. Si no hay snapshots del scope aún (cuenta recién
+    // creada o sin historial), caemos a saldo_inicial para no quedarnos en 0.
+    const parentSnap = snapByKey[anchorFechaFin + '|cuenta:' + c.id];
+    let anchorCuentaSaldo;
+    if (parentSnap != null) {
+      let subSnapTotal = 0;
+      subs.forEach(x => {
+        const a = snapByKey[anchorFechaFin + '|subcuenta:' + x.id];
+        subSnapTotal += (a != null ? a : Number(x.saldo_inicial || 0));
+      });
+      anchorCuentaSaldo = parentSnap + subSnapTotal;
+    } else {
+      anchorCuentaSaldo = parentInitial + subInitialTotal;
+    }
 
     // Txs del padre (sólo las post-anchor; las anteriores ya están en el snapshot).
     // Una subcuenta "huérfana" (de otra cuenta) se trata como movimiento del
