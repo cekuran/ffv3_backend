@@ -6,11 +6,12 @@ const SCHEMA = {
   Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','establecimiento_id','fecha_creacion'],
   Categorias:    ['owner','id','nombre','color','icono','tipo','orden'],
   Establecimientos:['owner','id','nombre','web'],
-  Transacciones: ['owner','id','fecha','tipo','importe','moneda','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id'],
+  Transacciones: ['owner','id','fecha','tipo','importe','moneda','importe_en_defecto','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id'],
   Recurrentes:   ['owner','id','plantilla','ultima_generacion','activa','mes_inicio','anio_inicio'],
   Presupuestos:  ['owner','id','anio','mes','categoria_id','importe_esperado'],
   Conciliaciones:['owner','id','fecha','cuenta_id','saldo_sistema','saldo_banco','diferencia','notas'],
   TiposCambio:   ['owner','id','fecha','base','destino','ratio'],
+  Divisas:       ['owner','id','codigo','nombre','simbolo','por_defecto','activa','orden'],
   Snapshots:     ['owner','id','fecha_fin','scope','scope_id','saldo','fecha_creacion']
 };
 
@@ -46,8 +47,27 @@ const SEMILLA = {
     { nombre: 'Suscripciones',  color: '#0050af', icono: 'subscriptions',   tipo: 'gasto',  orden: 6 },
     { nombre: 'Nómina',         color: '#006c46', icono: 'payments',        tipo: 'ingreso',orden: 7 },
     { nombre: 'Ingresos extra', color: '#107c52', icono: 'work',            tipo: 'ingreso',orden: 8 }
+  ],
+  // ponytail: Divisas seed. EUR es la moneda por defecto; las demás son
+  // alternativas que el usuario puede usar al registrar tx. `por_defecto`
+  // sólo es true en una fila a la vez; cambiarlo se hace con
+  // setDivisaPorDefecto (ver más abajo).
+  Divisas: [
+    { codigo: 'EUR', nombre: 'Euro',                 simbolo: '€', por_defecto: true,  activa: true, orden: 1 },
+    { codigo: 'USD', nombre: 'Dólar estadounidense', simbolo: '$', por_defecto: false, activa: true, orden: 2 },
+    { codigo: 'COP', nombre: 'Peso colombiano',      simbolo: '$', por_defecto: false, activa: true, orden: 3 },
+    { codigo: 'MXN', nombre: 'Peso mexicano',        simbolo: '$', por_defecto: false, activa: true, orden: 4 },
+    { codigo: 'GBP', nombre: 'Libra esterlina',      simbolo: '£', por_defecto: false, activa: true, orden: 5 },
+    { codigo: 'ARS', nombre: 'Peso argentino',       simbolo: '$', por_defecto: false, activa: true, orden: 6 },
+    { codigo: 'CLP', nombre: 'Peso chileno',         simbolo: '$', por_defecto: false, activa: true, orden: 7 },
+    { codigo: 'PEN', nombre: 'Sol peruano',          simbolo: 'S/', por_defecto: false, activa: true, orden: 8 }
   ]
 };
+
+// ponytail: lista canónica de códigos que aceptamos al validar/crear
+// divisas. Cualquier otro código se rechaza para evitar proliferación de
+// cadenas arbitrarias (símbolos, nombres mal escritos) en los sheets.
+const CODIGOS_MONEDA_PERMITIDOS = ['EUR','USD','COP','MXN','GBP','ARS','CLP','PEN','BRL','CAD','CHF','JPY','CNY','UYU','VES'];
 
 // ───────── Helpers de sesión y ss ─────────
 const MASTER_PROP_KEY = 'MASTER_SPREADSHEET_ID';
@@ -1330,6 +1350,10 @@ function finMesAnterior_(fechaIso) {
 // Recorre las transacciones una sola vez y va acumulando el saldo por scope;
 // para cada cierre emite una fila de snapshot. Coste: O(N + M*S), mejor que
 // la ruta legacy O(M*N*S). Si el rango ya tiene snapshots, los reemplaza.
+//
+// ponytail: la cuenta es agregador puro de sus subcuentas, así que sólo
+// almacenamos snapshots de subcuentas. Las filas con scope='cuenta' que
+// pudieran existir de versiones previas se purgan al reescribir.
 function generarSnapshotsParaFechas_(fechaFins) {
   if (!fechaFins || !fechaFins.length) return;
   const cuentas = filasVisibles_('Cuentas');
@@ -1339,10 +1363,6 @@ function generarSnapshotsParaFechas_(fechaFins) {
 
   const scopes = [];
   top.forEach(c => {
-    scopes.push({
-      scope: 'cuenta', scope_id: c.id,
-      saldo: Number(c.saldo_inicial || 0)
-    });
     cuentas.filter(s => s.parent_id === c.id).forEach(s => {
       scopes.push({
         scope: 'subcuenta', scope_id: s.id,
@@ -1355,9 +1375,10 @@ function generarSnapshotsParaFechas_(fechaFins) {
     .sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
   const fechasSorted = fechaFins.slice().sort();
 
+  // Mantén filas existentes que NO son del rango ni del scope='cuenta' huérfano.
   const existing = leerSnapshots_();
   const setFechas = new Set(fechasSorted);
-  const keep = existing.filter(s => !setFechas.has(String(s.fecha_fin)));
+  const keep = existing.filter(s => s.scope === 'subcuenta' && !setFechas.has(String(s.fecha_fin)));
 
   const nuevas = [];
   let txIdx = 0;
@@ -1365,9 +1386,7 @@ function generarSnapshotsParaFechas_(fechaFins) {
     while (txIdx < txs.length && String(txs[txIdx].fecha) <= me) {
       const t = txs[txIdx];
       scopes.forEach(sk => {
-        sk.saldo += sk.scope === 'cuenta'
-          ? deltaCuenta_(t, sk.scope_id)
-          : deltaSubcuenta_(t, sk.scope_id);
+        sk.saldo += deltaSubcuenta_(t, sk.scope_id);
       });
       txIdx++;
     }
@@ -1664,6 +1683,7 @@ function sembrar(owner, seed) {
   const fuente = seed || SEMILLA;
   const fuenteCuentas = seed ? seed.cuentas : SEMILLA.Cuentas;
   const fuenteCategorias = seed ? seed.categorias : SEMILLA.Categorias;
+  const fuenteDivisas = seed && Array.isArray(seed.divisas) ? seed.divisas : SEMILLA.Divisas;
 
   const cuentas = fuenteCuentas.flatMap(c => {
     const parent = Object.assign({
@@ -1681,6 +1701,16 @@ function sembrar(owner, seed) {
     owner: owner, id: uid_('cat')
   }, c));
   escribirHoja('Categorias', leerHoja('Categorias').concat(cats));
+
+  // ponytail: Divisas se siembran una sola vez (catalogo + default). Si el
+  // sheet ya tiene filas, las respetamos (usuario pudo haber cambiado el
+  // default o añadido monedas).
+  if (fuenteDivisas && fuenteDivisas.length && !leerHoja('Divisas').length) {
+    const divs = fuenteDivisas.map((d, i) => Object.assign({
+      owner: owner, id: uid_('div')
+    }, d, { orden: d.orden != null ? d.orden : i + 1 }));
+    escribirHoja('Divisas', leerHoja('Divisas').concat(divs));
+  }
 }
 
 // ───────── Bootstrap público ─────────
@@ -1696,7 +1726,9 @@ const API_ACTIONS = new Set([
   'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion',
   'obtenerRecurrentes', 'guardarRecurrente', 'eliminarRecurrente', 'generarRecurrentesPendientes',
   'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar', 'obtenerConciliaciones', 'editarConciliacion', 'eliminarConciliacion',
-  'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'ejecutarSelfTestAdmin', 'ping', 'configurarSpreadsheetMaestro'
+  'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'eliminarTipoCambio', 'obtenerTiposCambio',
+  'obtenerDivisas', 'guardarDivisa', 'eliminarDivisa', 'setDivisaPorDefecto',
+  'ejecutarSelfTestAdmin', 'ping', 'configurarSpreadsheetMaestro'
 ]);
 
 function ping() {
@@ -1798,6 +1830,9 @@ function bootstrapBase() {
       recurrentes: [],
       presupuestos: [],
       resumen: null,
+      divisas: { default_codigo: 'EUR', items: [] },
+      tiposCambio: [],
+      moneda_por_defecto: 'EUR',
       sin_hojas: true,
       sin_datos_financieros: true
     };
@@ -1826,7 +1861,10 @@ function bootstrapBase() {
     establecimientos: obtenerEstablecimientos(),
     recurrentes: obtenerRecurrentes(),
     presupuestos: obtenerPresupuestos(),
-    resumen: obtenerResumen()
+    resumen: obtenerResumen(),
+    divisas: obtenerDivisas(),
+    tiposCambio: obtenerTiposCambio(),
+    moneda_por_defecto: codigoDefecto_()
   };
 }
 
@@ -1890,43 +1928,11 @@ function obtenerCuentas() {
   const result = top.map(c => {
     const subs = cuentas.filter(x => x.parent_id === c.id);
     const subIds = new Set(subs.map(x => x.id));
-    const parentInitial = Number(c.saldo_inicial || 0);
-    const subInitialTotal = subs.reduce((s, x) => s + Number(x.saldo_inicial || 0), 0);
-    // ponytail: el snapshot guarda el saldo del padre y el de cada subcuenta
-    // por separado. El "saldo total" del padre (lo que muestra la UI) es
-    // snap_padre + Σ snap_sub. Si no hay snapshots del scope aún (cuenta recién
-    // creada o sin historial), caemos a saldo_inicial para no quedarnos en 0.
-    const parentSnap = snapByKey[anchorFechaFin + '|cuenta:' + c.id];
-    let anchorCuentaSaldo;
-    if (parentSnap != null) {
-      let subSnapTotal = 0;
-      subs.forEach(x => {
-        const a = snapByKey[anchorFechaFin + '|subcuenta:' + x.id];
-        subSnapTotal += (a != null ? a : Number(x.saldo_inicial || 0));
-      });
-      anchorCuentaSaldo = parentSnap + subSnapTotal;
-    } else {
-      anchorCuentaSaldo = parentInitial + subInitialTotal;
-    }
-
-    // Txs del padre (sólo las post-anchor; las anteriores ya están en el snapshot).
-    // Una subcuenta "huérfana" (de otra cuenta) se trata como movimiento del
-    // padre, no se atribuye a la cuenta ajena.
-    const parentTxs = liveTxs.filter(t => {
-      const origen = t.cuenta_id === c.id;
-      const destino = t.cuenta_destino_id === c.id;
-      if (!origen && !destino) return false;
-      if (origen && t.subcuenta_id && subIds.has(t.subcuenta_id)) return false;
-      if (destino) {
-        const reparto = parseRepartoDestino_(t.reparto_destino);
-        const subDest = reparto.length
-          ? reparto.map(r => r.subcuenta_id)
-          : (t.subcuenta_destino_id ? [t.subcuenta_destino_id] : []);
-        if (subDest.some(id => subIds.has(id))) return false;
-      }
-      return true;
-    });
-
+    // ponytail: la cuenta es un agregador puro de sus subcuentas. Su saldo
+    // y saldo_inicial en la API son la suma directa de las subcuentas. El
+    // c.saldo_inicial propio del padre se trata como metadato: si era > 0,
+    // distribúyelo a la subcuenta que corresponda antes de este cambio (ya
+    // no se refleja en cuenta.saldo para que coincida con sum(subs)).
     const subcuentas = subs.map(s => {
       const subInitial = Number(s.saldo_inicial || 0);
       // ponytail: devoluciones con destino también imputan a la subcuenta
@@ -1953,14 +1959,8 @@ function obtenerCuentas() {
       };
     }).sort((a, b) => a.orden - b.orden);
 
-    // Saldo del padre = anchor del padre + deltas post-anchor (parentTxs + deltas de subcuentas en live).
-    let subDeltaLive = 0;
-    subcuentas.forEach(x => {
-      const aVal = snapByKey[anchorFechaFin + '|subcuenta:' + x.id];
-      const anchorForX = aVal != null ? aVal : Number(x.saldo_inicial || 0);
-      subDeltaLive += x.saldo - anchorForX;
-    });
-    const parentDelta = parentTxs.reduce((s, t) => s + deltaCuenta_(t, c.id), 0);
+    const cuentaSaldo = subcuentas.reduce((s, x) => s + x.saldo, 0);
+    const cuentaSaldoInicial = subcuentas.reduce((s, x) => s + x.saldo_inicial, 0);
 
     const hoy = new Date();
     const evolucion = [];
@@ -1968,19 +1968,25 @@ function obtenerCuentas() {
       const d = new Date(hoy.getFullYear(), hoy.getMonth() - i, 1);
       const k = fmtMes(d);
       const lastDayK = iso_(new Date(d.getFullYear(), d.getMonth() + 1, 0));
-      const snapKey = lastDayK + '|cuenta:' + c.id;
-      const snapSaldo = snapByKey[snapKey];
-      if (snapSaldo !== undefined) {
-        // Mes cerrado: servimos directo desde snapshot.
-        evolucion.push({ mes: k, saldo: snapSaldo });
+      const todasLasSubsTienenSnapK = subs.every(x => snapByKey[lastDayK + '|subcuenta:' + x.id] != null);
+      if (todasLasSubsTienenSnapK) {
+        // Mes cerrado: suma directa de los snapshots de las subcuentas.
+        let subSnapTotalK = 0;
+        subs.forEach(x => {
+          subSnapTotalK += snapByKey[lastDayK + '|subcuenta:' + x.id];
+        });
+        evolucion.push({ mes: k, saldo: subSnapTotalK });
       } else {
-        // Mes en curso o sin snapshot todavía: anchor + deltas live hasta lastDayK.
-        const parentDeltaK = parentTxs
-          .filter(t => String(t.fecha) <= lastDayK)
-          .reduce((s, t) => s + deltaCuenta_(t, c.id), 0);
+        // Mes en curso o subcuentas aún sin snapshot: anchor (suma snaps_sub)
+        // + deltas live de subcuentas hasta lastDayK.
+        let anchorSubTotal = 0;
+        subs.forEach(x => {
+          const a = snapByKey[anchorFechaFin + '|subcuenta:' + x.id];
+          anchorSubTotal += (a != null ? a : Number(x.saldo_inicial || 0));
+        });
         const subDeltaK = subcuentas.reduce((s, sub) => {
-          const anchorSubForK = snapByKey[anchorFechaFin + '|subcuenta:' + sub.id];
-          const base = anchorSubForK != null ? anchorSubForK : Number(sub.saldo_inicial || 0);
+          const base = snapByKey[anchorFechaFin + '|subcuenta:' + sub.id];
+          const baseVal = base != null ? base : Number(sub.saldo_inicial || 0);
           const live = liveTxs
             .filter(t => {
               if (String(t.fecha) > lastDayK) return false;
@@ -1991,16 +1997,17 @@ function obtenerCuentas() {
               return t.subcuenta_destino_id === sub.id;
             })
             .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id), 0);
-          return s + (base + live - sub.saldo_inicial);
+          // delta respecto al inicial: lo que se mueve esta sub en (anchor, lastDayK].
+          return s + (baseVal + live - Number(sub.saldo_inicial || 0));
         }, 0);
-        evolucion.push({ mes: k, saldo: anchorCuentaSaldo + parentDeltaK + subDeltaK });
+        evolucion.push({ mes: k, saldo: anchorSubTotal + subDeltaK });
       }
     }
 
     return {
       id: c.id, nombre: c.nombre, tipo: c.tipo, moneda: c.moneda, icono: c.icono, establecimiento_id: c.establecimiento_id || '',
-      saldo_inicial: parentInitial,
-      saldo: anchorCuentaSaldo + parentDelta + subDeltaLive,
+      saldo_inicial: cuentaSaldoInicial,
+      saldo: cuentaSaldo,
       evolucion,
       subcuentas
     };
@@ -2541,6 +2548,32 @@ function guardarTransaccion(tx) {
   } else if (tx.subcuenta_destino_id && tipo !== 'devolucion') {
     throw new Error('Subcuenta destino solo aplica a transferencias o devoluciones con destino');
   }
+  // ponytail: defaults. Si el usuario no eligió subcuenta, asignamos la
+  // primera sub de la cuenta. La cuenta es agregador puro de subcuentas,
+  // así que sin sub explícita el delta no impactaría al saldo mostrado.
+  // Cada cuenta tiene al menos una sub por
+  // normalizarCuentasSinSubcuentas_; si no la tiene, el delta cae a
+  // parent-level (compatible con datos huérfanos).
+  // Para EDICIONES (existente != null) preservamos la sub original del payload
+  // (incluyendo cadena vacía) para no rescribir txs legadas; sólo aplicamos
+  // el default cuando es un alta nueva (existente == null).
+  if (!subcuenta_id && tx.cuenta_id) {
+    if (existente && existente.subcuenta_id) {
+      subcuenta_id = existente.subcuenta_id;
+    } else if (!existente) {
+      const defaultSub = cuentasHoja.find(c => c.parent_id === tx.cuenta_id);
+      if (defaultSub) subcuenta_id = defaultSub.id;
+    }
+  }
+  if (!subcuenta_destino_id && !repartoDestinoJson &&
+      (tipo === 'transferencia' || tipo === 'devolucion') && tx.cuenta_destino_id) {
+    if (existente && existente.subcuenta_destino_id) {
+      subcuenta_destino_id = existente.subcuenta_destino_id;
+    } else if (!existente) {
+      const defaultSubDest = cuentasHoja.find(c => c.parent_id === tx.cuenta_destino_id);
+      if (defaultSubDest) subcuenta_destino_id = defaultSubDest.id;
+    }
+  }
   if ((tipo === 'transferencia' || tipo === 'devolucion') && tx.cuenta_destino_id) {
     const dest = cuentasHoja.find(c => c.id === tx.cuenta_destino_id);
     if (!dest) throw new Error('Cuenta destino no encontrada');
@@ -2616,6 +2649,24 @@ function guardarTransaccion(tx) {
   }
   if (fila.tipo === 'transferencia' && fila.ratio_conversion && !(fila.importe_destino > 0)) {
     throw new Error('Falta importe destino o ratio de conversión');
+  }
+  // ponytail: si el cliente no envió importe_en_defecto, lo calculamos
+  // automáticamente desde el último tipo de cambio. Si la moneda de la tx
+  // coincide con la default, no hay conversión: importe_en_defecto = importe.
+  // Si difiere y no hay tasa registrada, rechazamos: el usuario debe añadir
+  // el tipo de cambio antes de registrar la tx (eso evita totales falsos en
+  // el resumen).
+  const defaultCodigo = codigoDefecto_();
+  if (fila.moneda === defaultCodigo) {
+    fila.importe_en_defecto = fila.importe;
+  } else if (tx.importe_en_defecto != null && Number(tx.importe_en_defecto) > 0) {
+    fila.importe_en_defecto = Number(tx.importe_en_defecto);
+  } else {
+    const ratio = buscarTipoCambio_(fila.moneda, defaultCodigo);
+    if (!(ratio > 0)) {
+      throw new Error('Falta tipo de cambio para convertir ' + fila.moneda + ' a ' + defaultCodigo + '. Añádelo en Divisas.');
+    }
+    fila.importe_en_defecto = Number((fila.importe * ratio).toFixed(2));
   }
   upsertFila('Transacciones', fila);
   // ponytail: ajustar snapshots mensuales al cambio. Si la fecha de la tx
@@ -2907,6 +2958,7 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
   const actor = currentUser_() || owner;
   const recs = leerHoja('Recurrentes').filter(r => r.owner === owner && r.activa);
   const txs = leerHoja('Transacciones');
+  const cuentasHoja = leerHoja('Cuentas');
   let cambios = false;
   recs.forEach(r => {
     try {
@@ -2952,7 +3004,11 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
         if (!ya) {
           txs.push({
             owner: owner, id: uid_('tx'),
-            fecha: isoCursor, tipo: p.tipo, importe: Number(p.importe), moneda: 'EUR',
+            fecha: isoCursor, tipo: p.tipo, importe: Number(p.importe),
+            // ponytail: heredar la moneda de la plantilla (o de la cuenta) en
+            // lugar de hardcodear EUR — así un recurrente en USD no se
+            // convierte en EUR al materializarse.
+            moneda: String(p.moneda || '').toUpperCase() || (cuentasHoja.find(c => c.id === p.cuenta_id) || {}).moneda || codigoDefecto_(),
             cuenta_id: p.cuenta_id,
             subcuenta_id: p.subcuenta_id || '',
             cuenta_destino_id: p.cuenta_destino_id || '',
@@ -3129,20 +3185,24 @@ function obtenerResumen(anio, mes) {
   const cuentasById = {};
   filasVisibles_('Cuentas')
     .forEach(c => { cuentasById[c.id] = c; });
+  // ponytail: helper de agregación. Los importes pueden venir en una moneda
+  // distinta a la por defecto; usamos importe_en_defecto (autocalculado al
+  // guardar la tx) y, si la fila es legacy y no lo tiene, caemos a importe.
+  const impDef = t => Number(t.importe_en_defecto != null && t.importe_en_defecto !== '' ? t.importe_en_defecto : (t.importe || 0));
   const enMes = txs.filter(t => {
     const f = new Date(t.fecha);
     return f.getFullYear() === Number(a) && (f.getMonth() + 1) === Number(m);
   });
-  const ingresos = enMes.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + Number(t.importe || 0), 0);
-  const gastos = enMes.filter(t => t.tipo === 'gasto').reduce((s, t) => s + Number(t.importe || 0), 0);
+  const ingresos = enMes.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + impDef(t), 0);
+  const gastos = enMes.filter(t => t.tipo === 'gasto').reduce((s, t) => s + impDef(t), 0);
   // ponytail: devoluciones restan del total de gastos del mes (revierte gastos).
-  const devoluciones = enMes.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + Number(t.importe || 0), 0);
+  const devoluciones = enMes.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + impDef(t), 0);
   const transferenciasGasto = enMes
     .filter(t => t.tipo === 'transferencia' && tipoTransferenciaPresupuestoTx_(t, cuentasById) === 'gasto')
-    .reduce((s, t) => s + Number(t.importe || 0), 0);
+    .reduce((s, t) => s + impDef(t), 0);
   const transferenciasIngreso = enMes
     .filter(t => t.tipo === 'transferencia' && tipoTransferenciaPresupuestoTx_(t, cuentasById) === 'ingreso')
-    .reduce((s, t) => s + Number(t.importe || 0), 0);
+    .reduce((s, t) => s + impDef(t), 0);
   const pendiente = enMes.filter(t => t.estado === 'pendiente').length;
   const vencido = enMes.filter(t => t.estado === 'vencido').length;
   // Evolución últimos 12 meses
@@ -3155,9 +3215,9 @@ function obtenerResumen(anio, mes) {
     const en = txs.filter(t => String(t.fecha).slice(0, 7) === k);
     evol.push({
       mes: k,
-      ingresos: en.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + Number(t.importe || 0), 0),
-      gastos: en.filter(t => t.tipo === 'gasto').reduce((s, t) => s + Number(t.importe || 0), 0)
-              - en.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + Number(t.importe || 0), 0)
+      ingresos: en.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + impDef(t), 0),
+      gastos: en.filter(t => t.tipo === 'gasto').reduce((s, t) => s + impDef(t), 0)
+              - en.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + impDef(t), 0)
     });
   }
   // Próximos recurrentes
@@ -3225,14 +3285,17 @@ function obtenerResumenEstablecimientos(anio, mes) {
   const porId = {};
   filas.forEach(f => { porId[f.id] = f; });
   const periodo = a + '-' + String(m).padStart(2, '0');
+  // ponytail: agregamos en moneda por defecto (importe_en_defecto) para que
+  // mezclar txs en EUR + USD no distorsione el resumen.
+  const impDef = t => Number(t.importe_en_defecto != null && t.importe_en_defecto !== '' ? t.importe_en_defecto : (t.importe || 0));
 
   leerHoja('Transacciones')
     .filter(t => String(t.fecha).slice(0, 7) === periodo && (t.tipo === 'gasto' || t.tipo === 'ingreso' || t.tipo === 'devolucion'))
     .forEach(t => {
       const fila = porId[String(t.establecimiento_id || '')] || porId[''];
-      if (t.tipo === 'ingreso') fila.ingresos += Number(t.importe || 0);
-      else if (t.tipo === 'gasto') fila.gastos += Number(t.importe || 0);
-      else if (t.tipo === 'devolucion') fila.gastos -= Number(t.importe || 0); // ponytail: revierten gasto
+      if (t.tipo === 'ingreso') fila.ingresos += impDef(t);
+      else if (t.tipo === 'gasto') fila.gastos += impDef(t);
+      else if (t.tipo === 'devolucion') fila.gastos -= impDef(t); // ponytail: revierten gasto
     });
   filas.forEach(f => { f.neto = f.ingresos - f.gastos; });
   return { anio: a, mes: m, filas: filas };
@@ -3249,6 +3312,9 @@ function obtenerCategoriasResumen(anio, mes) {
   const cuentasById = {};
   filasVisibles_('Cuentas')
     .forEach(c => { cuentasById[c.id] = c; });
+  // ponytail: agregamos en moneda por defecto para que un gasto en COP no
+  // sume como 100000 EUR en la misma categoría.
+  const impDef = t => Number(t.importe_en_defecto != null && t.importe_en_defecto !== '' ? t.importe_en_defecto : (t.importe || 0));
   // Reparto destino de transferencias: cada subcuenta se imputa a su propia
   // categoría (gasto o ingreso según la dirección activo/pasivo).
   // No se usa categoria_id del tx como fallback para evitar el campo separado.
@@ -3262,7 +3328,16 @@ function obtenerCategoriasResumen(anio, mes) {
     const rep = parseRepartoDestino_(t.reparto_destino);
     if (rep.length) {
       rep.forEach(r => {
-        const imp = Number(r.importe || 0);
+        // ponytail: r.importe está en la moneda de la cuenta destino (lo que
+        // el usuario tecleó). Para agregarlo junto a gastos directos en
+        // moneda default, prorrateamos: la fracción del reparto (r.importe /
+        // total_reparto) se aplica al importe_en_defecto total del tx. Esto
+        // aproxima la conversión "por subcuenta" sin requerir un tipo de
+        // cambio explícito por subcuenta; si ambas cuentas están en la misma
+        // moneda el resultado coincide con r.importe.
+        const totalRep = rep.reduce((s, x) => s + Number(x.importe || 0), 0);
+        const frac = totalRep > 0 ? Number(r.importe || 0) / totalRep : 0;
+        const imp = impDef(t) * frac;
         if (!(imp > 0)) return;
         const catId = r.categoria_id || '';
         const cat = catsById[catId];
@@ -3282,23 +3357,191 @@ function obtenerCategoriasResumen(anio, mes) {
       const f = new Date(t.fecha);
       return f.getFullYear() === Number(a) && (f.getMonth() + 1) === Number(m);
     }).reduce((s, t) => {
-      const imp = Number(t.importe || 0);
+      const imp = impDef(t);
       return s + (t.tipo === 'devolucion' ? -imp : imp);
     }, 0) + (porCatRep[c.id] || 0);
     return { id: c.id, nombre: c.nombre, color: c.color, esperado, real, diferencia: real - esperado };
   });
 }
 
+// ───────── Divisas y tipos de cambio ─────────
+// ponytail: la app trata el campo `moneda` como una cadena de 3 letras
+// mayúsculas (código ISO 4217 abreviado). El sheet `Divisas` es el catálogo:
+// contiene tanto las monedas alternativas que el usuario quiere usar como el
+// flag `por_defecto` que apunta a la moneda canónica de la hoja. Las
+// transacciones guardan el importe original en `importe` (en su moneda) y, en
+// `importe_en_defecto`, la conversión al default calculada al guardar.
+// Reportes/resumen suman siempre `importe_en_defecto || importe`, así nunca
+// mezclan peras con manzanas.
+
+function obtenerDivisaPorDefecto_() {
+  const filas = leerHoja('Divisas');
+  const match = filas.find(d =>
+    (d.por_defecto === true || String(d.por_defecto) === 'true') &&
+    d.activa !== false && String(d.activa) !== 'false'
+  );
+  return match || null;
+}
+
+function codigoDefecto_() {
+  const d = obtenerDivisaPorDefecto_();
+  return d ? String(d.codigo || '').toUpperCase() : 'EUR';
+}
+
+function buscarTipoCambio_(base, destino) {
+  base = String(base || '').toUpperCase();
+  destino = String(destino || '').toUpperCase();
+  if (!base || !destino || base === destino) return null;
+  const filas = leerHoja('TiposCambio');
+  // Orden por fecha desc; quedarnos con el más reciente.
+  const ordenadas = filas
+    .filter(t => String(t.base || '').toUpperCase() === base && String(t.destino || '').toUpperCase() === destino)
+    .sort((a, b) => String(b.fecha || '').localeCompare(String(a.fecha || '')));
+  if (ordenadas.length) return Number(ordenadas[0].ratio || 0);
+  // Si sólo tenemos la dirección inversa, la invertimos. guardarTipoCambio
+  // ya escribe ambas, pero tolerar hojas legacy que sólo tengan una.
+  const inversa = filas
+    .filter(t => String(t.base || '').toUpperCase() === destino && String(t.destino || '').toUpperCase() === base)
+    .sort((a, b) => String(b.fecha || '').localeCompare(String(a.fecha || '')));
+  if (inversa.length && Number(inversa[0].ratio || 0) > 0) return 1 / Number(inversa[0].ratio);
+  return null;
+}
+
+function obtenerDivisas() {
+  const items = leerHoja('Divisas')
+    .map(d => ({
+      id: d.id,
+      codigo: String(d.codigo || '').toUpperCase(),
+      nombre: String(d.nombre || ''),
+      simbolo: String(d.simbolo || ''),
+      por_defecto: d.por_defecto === true || String(d.por_defecto) === 'true',
+      activa: d.activa !== false && String(d.activa) !== 'false',
+      orden: Number(d.orden || 99)
+    }))
+    .sort((a, b) => a.orden - b.orden || a.codigo.localeCompare(b.codigo));
+  return { default_codigo: codigoDefecto_(), items: items };
+}
+
+function guardarDivisa(divisa) {
+  if (!divisa) throw new Error('Datos de divisa vacíos');
+  const codigo = String(divisa.codigo || '').toUpperCase().trim();
+  if (!/^[A-Z]{3}$/.test(codigo)) throw new Error('Código de divisa inválido (3 letras mayúsculas)');
+  if (CODIGOS_MONEDA_PERMITIDOS.indexOf(codigo) < 0) {
+    throw new Error('Código no permitido. Permitidos: ' + CODIGOS_MONEDA_PERMITIDOS.join(', '));
+  }
+  const filas = leerHoja('Divisas');
+  const existente = divisa.id ? filas.find(d => d.id === divisa.id) : filas.find(d => String(d.codigo || '').toUpperCase() === codigo);
+  const fila = {
+    owner: (existente && existente.owner) || username_(),
+    id: existente ? existente.id : uid_('div'),
+    codigo: codigo,
+    nombre: String(divisa.nombre || codigo).trim(),
+    simbolo: String(divisa.simbolo || '').trim(),
+    // por_defecto: si lo mandan explícito, ese gana; si no, conservamos el valor
+    // actual. Evita que un editar-descripción desmarque el default por descuido.
+    por_defecto: divisa.por_defecto !== undefined
+      ? (divisa.por_defecto === true || String(divisa.por_defecto) === 'true')
+      : (existente ? existente.por_defecto : false),
+    activa: divisa.activa !== undefined
+      ? (divisa.activa !== false && String(divisa.activa) !== 'false')
+      : (existente ? existente.activa : true),
+    orden: divisa.orden != null ? Number(divisa.orden) : (existente ? Number(existente.orden || 99) : 99)
+  };
+  upsertFila('Divisas', fila);
+  return obtenerDivisas();
+}
+
+function eliminarDivisa(id) {
+  const idStr = String(id || '').trim();
+  if (!idStr) throw new Error('Indica la divisa');
+  const filas = leerHoja('Divisas');
+  const target = filas.find(d => d.id === idStr);
+  if (!target) throw new Error('Divisa no encontrada');
+  if (target.por_defecto === true || String(target.por_defecto) === 'true') {
+    throw new Error('No se puede eliminar la moneda por defecto');
+  }
+  const codigo = String(target.codigo || '').toUpperCase();
+  if (leerHoja('Cuentas').some(c => String(c.moneda || '').toUpperCase() === codigo)) {
+    throw new Error('Hay cuentas que usan esta moneda; reasígnalas primero');
+  }
+  if (leerHoja('Transacciones').some(t => String(t.moneda || '').toUpperCase() === codigo)) {
+    throw new Error('Hay transacciones en esta moneda; no se puede eliminar');
+  }
+  escribirHoja('Divisas', filas.filter(d => d.id !== idStr));
+  return obtenerDivisas();
+}
+
+function setDivisaPorDefecto(id) {
+  const idStr = String(id || '').trim();
+  if (!idStr) throw new Error('Indica la divisa');
+  const filas = leerHoja('Divisas');
+  const target = filas.find(d => d.id === idStr);
+  if (!target) throw new Error('Divisa no encontrada');
+  if (target.activa === false || String(target.activa) === 'false') {
+    throw new Error('No se puede marcar como default una moneda inactiva');
+  }
+  // ponytail: una sola fila con por_defecto=true. Lo movemos en una pasada
+  // sobre las filas y escribimos todo el sheet. Si alguien más tiene la
+  // anterior marcada, la desmarcamos aquí mismo.
+  const actualizado = filas.map(d => Object.assign({}, d, {
+    por_defecto: d.id === idStr
+  }));
+  escribirHoja('Divisas', actualizado);
+  return obtenerDivisas();
+}
+
+function obtenerTiposCambio() {
+  const filas = leerHoja('TiposCambio')
+    .map(t => ({
+      id: t.id,
+      fecha: String(t.fecha || ''),
+      base: String(t.base || '').toUpperCase(),
+      destino: String(t.destino || '').toUpperCase(),
+      ratio: Number(t.ratio || 0)
+    }))
+    .sort((a, b) => String(b.fecha || '').localeCompare(String(a.fecha || '')) || a.base.localeCompare(b.base));
+  return filas;
+}
+
+function eliminarTipoCambio(id) {
+  const idStr = String(id || '').trim();
+  if (!idStr) throw new Error('Indica el tipo de cambio');
+  const filas = leerHoja('TiposCambio');
+  if (!filas.some(t => t.id === idStr)) throw new Error('Tipo de cambio no encontrado');
+  escribirHoja('TiposCambio', filas.filter(t => t.id !== idStr));
+  return obtenerTiposCambio();
+}
+
 function guardarTipoCambio(base, destino, ratio) {
   const owner = username_();
   if (!(ratio > 0)) throw new Error('Ratio debe ser > 0');
-  const fila = {
+  const b = String(base || '').toUpperCase();
+  const d = String(destino || '').toUpperCase();
+  if (!b || !d) throw new Error('Base y destino obligatorios');
+  if (b === d) throw new Error('Base y destino deben ser distintos');
+  const fecha = isoHoy_();
+  const directa = {
     owner: owner, id: uid_('tc'),
-    fecha: isoHoy_(), base: String(base).toUpperCase(), destino: String(destino).toUpperCase(),
-    ratio: Number(ratio)
+    fecha: fecha, base: b, destino: d, ratio: Number(ratio)
   };
-  upsertFila('TiposCambio', fila);
-  return fila;
+  upsertFila('TiposCambio', directa);
+  // ponytail: escribir también la inversa 1/ratio para que las conversiones
+  // (buscarTipoCambio_) nunca tengan que invertir. Si la inversa ya existía
+  // hoy, la sobreescribimos con la nueva para mantener la simetría.
+  const inversa = {
+    owner: owner, id: uid_('tc'),
+    fecha: fecha, base: d, destino: b, ratio: 1 / Number(ratio)
+  };
+  // upsertFila usa el id para encontrar: asignamos ids estables para no
+  // duplicar. Buscamos el id existente de la inversa y lo reutilizamos.
+  const existenteInversa = leerHoja('TiposCambio').find(t =>
+    String(t.base || '').toUpperCase() === d &&
+    String(t.destino || '').toUpperCase() === b &&
+    String(t.fecha || '') === fecha
+  );
+  if (existenteInversa) inversa.id = existenteInversa.id;
+  upsertFila('TiposCambio', inversa);
+  return directa;
 }
 
 // ───────── Self-test mínimo ─────────
@@ -3431,6 +3674,10 @@ function __selfTestBody_(owner) {
     parent_id: parent.id, nombre: subName, saldo_inicial: 100
   });
   const subId = withSub.find(c => c.id === parent.id).subcuentas.find(s => s.nombre === subName).id;
+  // Capturamos el saldo del padre justo después de crear la sub (no en
+  // `cuentas[0]`, que es una copia local del estado al inicio del test
+  // y no refleja los cambios posteriores).
+  const parentSaldoPreTx = withSub.find(c => c.id === parent.id).saldo;
   const txSub = guardarTransaccion({
     tipo: 'gasto', importe: 30, cuenta_id: parent.id, subcuenta_id: subId,
     categoria_id: cat[0].id, descripcion: 'self-sub-tx', fecha: isoHoy_()
@@ -3438,9 +3685,11 @@ function __selfTestBody_(owner) {
   const fresh = obtenerCuentas().find(c => c.id === parent.id);
   const sub = (fresh.subcuentas || []).find(s => s.id === subId);
   if (!sub || sub.saldo !== 70) throw new Error('Saldo subcuenta incorrecto: ' + (sub && sub.saldo));
-  // Modelo de partición: el saldo_inicial (100) de la subcuenta ya forma parte del
-  // saldo del padre, así que crearla no cambia el total; solo el gasto (30) lo baja.
-  if (fresh.saldo !== parent.saldo - 30) throw new Error('Saldo padre incorrecto: ' + fresh.saldo);
+  // ponytail: la cuenta es agregador puro de subcuentas, así que el gasto de
+  // -30 sobre la nueva sub baja el saldo del padre exactamente 30.
+  if (Math.abs(fresh.saldo - (parentSaldoPreTx - 30)) > 0.01) {
+    throw new Error('Saldo padre incorrecto: ' + fresh.saldo + ' vs ' + (parentSaldoPreTx - 30));
+  }
   // Reorder y segunda alta sin reemplazar la primera
   const anotherName = 'self-sub-' + Utilities.getUuid().slice(0, 8);
   const withAnother = guardarCuenta({
@@ -3824,6 +4073,119 @@ function __selfTestBody_(owner) {
   if (Math.abs(restaurado - antesSnap) > 0.01) {
     throw new Error('Borrado no restauró saldo del anchor: restaurado=' + restaurado + ' antes=' + antesSnap);
   }
+
+  // ponytail: smoke-test del sistema de divisas. Cubre:
+  //   - guardar tx en EUR → importe_en_defecto === importe.
+  //   - guardar tx en USD (con tasa USD→EUR) → importe_en_defecto convertido.
+  //   - guardar tx en moneda sin tasa → rechaza con error claro.
+  //   - guardarTipoCambio escribe ambas direcciones.
+  //   - eliminarDivisa se niega si hay tx que la usen.
+  //   - setDivisaPorDefecto desmarca la anterior.
+  //   - bootstrapBase expone divisas + tiposCambio + moneda_por_defecto.
+  //   - resumen de categorías suma en moneda por defecto (mezcla EUR + USD).
+  const defCodigo = codigoDefecto_();
+  if (defCodigo !== 'EUR') throw new Error('Default de smoke-test esperaba EUR, fue ' + defCodigo);
+
+  // Tx en moneda default: importe_en_defecto == importe.
+  const txDef = guardarTransaccion({
+    tipo: 'gasto', importe: 42.5, cuenta_id: cuentas[0].id,
+    categoria_id: cat[0].id, descripcion: 'self-cur-default', fecha: isoHoy_(),
+    moneda: 'EUR'
+  });
+  if (Math.abs(Number(txDef.importe_en_defecto || 0) - 42.5) > 0.01) {
+    throw new Error('Tx en default: importe_en_defecto no copió importe: ' + txDef.importe_en_defecto);
+  }
+
+  // Registrar USD→EUR = 0.92. guardarTipoCambio debe escribir también EUR→USD.
+  const filasTCAntes = leerHoja('TiposCambio').length;
+  guardarTipoCambio('USD', 'EUR', 0.92);
+  const filasTCDespues = leerHoja('TiposCambio').length;
+  if (filasTCDespues < filasTCAntes + 2) {
+    throw new Error('guardarTipoCambio no escribió inversa: ' + filasTCAntes + ' → ' + filasTCDespues);
+  }
+  const directaUSD = leerHoja('TiposCambio').some(t =>
+    String(t.base) === 'USD' && String(t.destino) === 'EUR' && Math.abs(Number(t.ratio) - 0.92) < 0.0001);
+  const inversaUSD = leerHoja('TiposCambio').some(t =>
+    String(t.base) === 'EUR' && String(t.destino) === 'USD' && Math.abs(Number(t.ratio) - 1/0.92) < 0.0001);
+  if (!directaUSD || !inversaUSD) {
+    throw new Error('Faltan filas directa o inversa de TiposCambio');
+  }
+
+  // Tx en USD: importe_en_defecto debe ser importe * 0.92.
+  const txUSD = guardarTransaccion({
+    tipo: 'gasto', importe: 100, cuenta_id: cuentas[0].id,
+    categoria_id: cat[0].id, descripcion: 'self-cur-usd', fecha: isoHoy_(),
+    moneda: 'USD'
+  });
+  if (Math.abs(Number(txUSD.importe_en_defecto || 0) - 92) > 0.01) {
+    throw new Error('Tx USD: importe_en_defecto esperaba 92, fue ' + txUSD.importe_en_defecto);
+  }
+
+  // Tx en moneda sin tasa: debe rechazar.
+  let curErr = null;
+  try {
+    guardarTransaccion({
+      tipo: 'gasto', importe: 100, cuenta_id: cuentas[0].id,
+      categoria_id: cat[0].id, descripcion: 'self-cur-jpy', fecha: isoHoy_(),
+      moneda: 'JPY'
+    });
+  } catch (e) { curErr = e.message; }
+  if (!curErr || !/tipo de cambio/.test(curErr)) {
+    throw new Error('No rechazó tx en JPY sin tasa: ' + curErr);
+  }
+
+  // Resumen de categorías: mezcla EUR + USD en la misma categoría debe agregar
+  // en EUR (no en la suma directa de importes que mezclaría peras con manzanas).
+  const resumenCurCat = obtenerCategoriasResumen(hoy.getFullYear(), hoy.getMonth() + 1).find(r => r.id === catGasto.id);
+  // catGasto tiene 0 base (txBase/txDev fueron eliminados antes) + 42.5 (EUR)
+  // + 92 (USD convertido por la tasa 0.92).
+  const esperado = 0 + 42.5 + 92;
+  if (Math.abs(resumenCurCat.real - esperado) > 0.05) {
+    throw new Error('CategoriasResumen no sumó en moneda por defecto: real=' + resumenCurCat.real + ' esperado=' + esperado);
+  }
+
+  // bootstrapBase expone los nuevos campos.
+  const boot = bootstrapBase();
+  if (!boot.divisas || !Array.isArray(boot.divisas.items)) throw new Error('bootstrap.divisas.items ausente');
+  if (boot.divisas.default_codigo !== 'EUR') throw new Error('bootstrap.divisas.default_codigo != EUR');
+  if (!Array.isArray(boot.tiposCambio)) throw new Error('bootstrap.tiposCambio ausente');
+  if (boot.moneda_por_defecto !== 'EUR') throw new Error('bootstrap.moneda_por_defecto != EUR');
+
+  // setDivisaPorDefecto: marcar USD y verificar que EUR deja de ser default.
+  const usd = leerHoja('Divisas').find(d => String(d.codigo) === 'USD');
+  if (!usd) throw new Error('USD no aparece en Divisas tras sembrar');
+  setDivisaPorDefecto(usd.id);
+  if (codigoDefecto_() !== 'USD') throw new Error('setDivisaPorDefecto no movió el default');
+  // Restaurar EUR como default para no contaminar el resto del self-test.
+  const eur = leerHoja('Divisas').find(d => String(d.codigo) === 'EUR');
+  setDivisaPorDefecto(eur.id);
+  if (codigoDefecto_() !== 'EUR') throw new Error('No restauró EUR como default');
+
+  // eliminarDivisa: USD tiene txs, debe rechazar.
+  let delErr = null;
+  try { eliminarDivisa(usd.id); }
+  catch (e) { delErr = e.message; }
+  if (!delErr || !/transacciones/.test(delErr)) {
+    throw new Error('eliminarDivisa no rechazó USD con txs: ' + delErr);
+  }
+  // EUR es default → debe rechazar.
+  delErr = null;
+  try { eliminarDivisa(eur.id); }
+  catch (e) { delErr = e.message; }
+  if (!delErr || !/moneda por defecto/.test(delErr)) {
+    throw new Error('eliminarDivisa no rechazó default: ' + delErr);
+  }
+
+  // Limpieza smoke-test divisas.
+  eliminarTransaccion(txDef.id);
+  eliminarTransaccion(txUSD.id);
+  // Quitar las filas de TiposCambio creadas por el smoke-test.
+  const tcsCreadas = leerHoja('TiposCambio').filter(t =>
+    String(t.base) === 'USD' && String(t.destino) === 'EUR' && String(t.fecha) === isoHoy_());
+  tcsCreadas.forEach(t => eliminarFila('TiposCambio', t.id));
+  const tcsInversas = leerHoja('TiposCambio').filter(t =>
+    String(t.base) === 'EUR' && String(t.destino) === 'USD' && String(t.fecha) === isoHoy_());
+  tcsInversas.forEach(t => eliminarFila('TiposCambio', t.id));
 
   return 'ok ' + cuentas.length + ' cuentas, ' + cat.length + ' categorías, diferencia=' + conciliado.diferencia;
 }
