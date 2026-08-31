@@ -67,7 +67,12 @@ const SEMILLA = {
 // ponytail: lista canónica de códigos que aceptamos al validar/crear
 // divisas. Cualquier otro código se rechaza para evitar proliferación de
 // cadenas arbitrarias (símbolos, nombres mal escritos) en los sheets.
-const CODIGOS_MONEDA_PERMITIDOS = ['EUR','USD','COP','MXN','GBP','ARS','CLP','PEN','BRL','CAD','CHF','JPY','CNY','UYU','VES'];
+//
+// Comentario histórico: la allowlist se eliminó a petición del usuario —
+// la validación pasa a ser solo el patrón ISO 4217 de 3 letras mayúsculas.
+// El seed (SEMILLA.Divisas) sigue proponiendo 8 monedas habituales para que
+// la hoja recién creada tenga algo útil, pero el usuario puede añadir más
+// desde la vista Divisas sin pedir permiso.
 
 // ───────── Helpers de sesión y ss ─────────
 const MASTER_PROP_KEY = 'MASTER_SPREADSHEET_ID';
@@ -3426,9 +3431,6 @@ function guardarDivisa(divisa) {
   if (!divisa) throw new Error('Datos de divisa vacíos');
   const codigo = String(divisa.codigo || '').toUpperCase().trim();
   if (!/^[A-Z]{3}$/.test(codigo)) throw new Error('Código de divisa inválido (3 letras mayúsculas)');
-  if (CODIGOS_MONEDA_PERMITIDOS.indexOf(codigo) < 0) {
-    throw new Error('Código no permitido. Permitidos: ' + CODIGOS_MONEDA_PERMITIDOS.join(', '));
-  }
   const filas = leerHoja('Divisas');
   const existente = divisa.id ? filas.find(d => d.id === divisa.id) : filas.find(d => String(d.codigo || '').toUpperCase() === codigo);
   const fila = {
