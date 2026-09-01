@@ -1732,7 +1732,7 @@ const API_ACTIONS = new Set([
   'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion',
   'obtenerRecurrentes', 'guardarRecurrente', 'eliminarRecurrente', 'generarRecurrentesPendientes',
   'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar', 'obtenerConciliaciones', 'editarConciliacion', 'eliminarConciliacion',
-  'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'eliminarTipoCambio', 'obtenerTiposCambio',
+  'obtenerResumen', 'obtenerReporteMensual', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'eliminarTipoCambio', 'obtenerTiposCambio',
   'obtenerDivisas', 'guardarDivisa', 'eliminarDivisa', 'setDivisaPorDefecto',
   'obtenerViajes', 'guardarViaje', 'eliminarViaje', 'obtenerDetalleViaje', 'vincularTransaccionesViaje',
   'ejecutarSelfTestAdmin', 'ping', 'configurarSpreadsheetMaestro'
@@ -3431,8 +3431,100 @@ function obtenerCategoriasResumen(anio, mes) {
       const imp = impDef(t);
       return s + (t.tipo === 'devolucion' ? -imp : imp);
     }, 0) + (porCatRep[c.id] || 0);
-    return { id: c.id, nombre: c.nombre, color: c.color, esperado, real, diferencia: real - esperado };
+    return { id: c.id, nombre: c.nombre, color: c.color, tipo: c.tipo, esperado, real, diferencia: real - esperado };
   });
+}
+
+// ───────── Reporte mensual ─────────
+function obtenerReporteMensual(anio, mes) {
+  const a = Number(anio || new Date().getFullYear());
+  const m = Number(mes || (new Date().getMonth() + 1));
+  if (!Number.isInteger(a) || a < 2000 || a > 2100 || !Number.isInteger(m) || m < 1 || m > 12) {
+    throw new Error('Periodo inválido');
+  }
+
+  const desde = a + '-' + String(m).padStart(2, '0') + '-01';
+  const hasta = iso_(new Date(a, m, 0));
+  const inicioAnterior = iso_(new Date(a, m - 1, 0));
+  const txs = obtenerTransacciones({ desde: desde, hasta: hasta });
+  const todasTxs = leerHoja('Transacciones');
+  const cuentas = filasVisibles_('Cuentas').filter(c => !c.oculta);
+  const top = cuentas.filter(c => !c.parent_id)
+    .sort((a, b) => Number(a.orden || 99) - Number(b.orden || 99));
+
+  // Reutilizamos el cierre mensual de la vista de cuentas para no recorrer
+  // todo el historial cuando el periodo ya está cerrado.
+  asegurarSnapshotsAlDia_();
+  const snapshots = leerSnapshots_();
+  const snapByKey = {};
+  let anchorFechaFin = '';
+  snapshots.forEach(s => {
+    const fecha = String(s.fecha_fin || '');
+    snapByKey[fecha + '|' + s.scope + ':' + s.scope_id] = Number(s.saldo || 0);
+    if (fecha > anchorFechaFin) anchorFechaFin = fecha;
+  });
+
+  function saldoSubHasta_(sub, fecha) {
+    const fin = String(fecha || '');
+    const subId = String(sub.id);
+    const snap = snapByKey[fin + '|subcuenta:' + subId];
+    if (snap != null) return snap;
+    const anchor = snapByKey[anchorFechaFin + '|subcuenta:' + subId];
+    const base = anchor != null ? anchor : Number(sub.saldo_inicial || 0);
+    // Un mes anterior al anchor no puede reconstruirse desde un saldo más
+    // reciente: vuelve al saldo inicial y aplica todas las tx hasta el cierre.
+    const desde = anchor != null && fin > anchorFechaFin ? anchorFechaFin : '';
+    return base + todasTxs
+      .filter(t => (!desde || String(t.fecha) > desde) && String(t.fecha) <= fin)
+      .reduce((s, t) => s + deltaSubcuenta_(t, subId), 0);
+  }
+
+  function afectaCuenta_(tx, cuenta) {
+    if (tx.cuenta_id === cuenta.id) return true;
+    return (tx.tipo === 'transferencia' || tx.tipo === 'devolucion') && tx.cuenta_destino_id === cuenta.id;
+  }
+
+  function afectaSubcuenta_(tx, sub, parentId) {
+    if (tx.subcuenta_id === sub.id && tx.cuenta_id === parentId) return true;
+    if (tx.cuenta_destino_id !== parentId || (tx.tipo !== 'transferencia' && tx.tipo !== 'devolucion')) return false;
+    const reparto = parseRepartoDestino_(tx.reparto_destino);
+    return reparto.length
+      ? reparto.some(r => r.subcuenta_id === sub.id)
+      : tx.subcuenta_destino_id === sub.id;
+  }
+
+  const cuentasReporte = top.map(cuenta => {
+    const subcuentas = cuentas.filter(c => c.parent_id === cuenta.id);
+    const subReporte = subcuentas.map(sub => ({
+      id: sub.id,
+      nombre: sub.nombre,
+      parent_id: sub.parent_id,
+      saldo_inicial: saldoSubHasta_(sub, inicioAnterior),
+      saldo_final: saldoSubHasta_(sub, hasta),
+      movimientos: txs.filter(t => afectaSubcuenta_(t, sub, cuenta.id))
+    }));
+    return {
+      id: cuenta.id,
+      nombre: cuenta.nombre,
+      tipo: cuenta.tipo,
+      moneda: cuenta.moneda,
+      icono: cuenta.icono,
+      saldo_inicial: subReporte.reduce((s, sub) => s + sub.saldo_inicial, 0),
+      saldo_final: subReporte.reduce((s, sub) => s + sub.saldo_final, 0),
+      movimientos: txs.filter(t => afectaCuenta_(t, cuenta)),
+      subcuentas: subReporte
+    };
+  });
+
+  return {
+    anio: a,
+    mes: m,
+    periodo: { anio: a, mes: m, desde: desde, hasta: hasta },
+    resumen: obtenerResumen(a, m),
+    categorias: obtenerCategoriasResumen(a, m),
+    transacciones: txs,
+    cuentas: cuentasReporte
+  };
 }
 
 // ───────── Divisas y tipos de cambio ─────────
@@ -3919,6 +4011,11 @@ function __selfTestBody_(owner) {
     parent_id: parent.id, nombre: subName, saldo_inicial: 100
   });
   const subId = withSub.find(c => c.id === parent.id).subcuentas.find(s => s.nombre === subName).id;
+  const reportSubBefore = obtenerReporteMensual(new Date().getFullYear(), new Date().getMonth() + 1)
+    .cuentas.find(c => c.id === parent.id).subcuentas.find(s => s.id === subId);
+  if (!reportSubBefore || Math.abs(Number(reportSubBefore.saldo_inicial || 0) - 100) > 0.01) {
+    throw new Error('Reporte: saldo inicial de subcuenta incorrecto');
+  }
   // Capturamos el saldo del padre justo después de crear la sub (no en
   // `cuentas[0]`, que es una copia local del estado al inicio del test
   // y no refleja los cambios posteriores).
@@ -3934,6 +4031,18 @@ function __selfTestBody_(owner) {
   // -30 sobre la nueva sub baja el saldo del padre exactamente 30.
   if (Math.abs(fresh.saldo - (parentSaldoPreTx - 30)) > 0.01) {
     throw new Error('Saldo padre incorrecto: ' + fresh.saldo + ' vs ' + (parentSaldoPreTx - 30));
+  }
+  const reportAfter = obtenerReporteMensual(new Date().getFullYear(), new Date().getMonth() + 1)
+    .cuentas.find(c => c.id === parent.id);
+  const reportSubAfter = (reportAfter.subcuentas || []).find(s => s.id === subId);
+  if (!reportSubAfter || Math.abs(Number(reportSubAfter.saldo_final || 0) - 70) > 0.01) {
+    throw new Error('Reporte: saldo final de subcuenta incorrecto');
+  }
+  const reportSubTotalInitial = reportAfter.subcuentas.reduce((s, x) => s + Number(x.saldo_inicial || 0), 0);
+  const reportSubTotalFinal = reportAfter.subcuentas.reduce((s, x) => s + Number(x.saldo_final || 0), 0);
+  if (Math.abs(Number(reportAfter.saldo_inicial || 0) - reportSubTotalInitial) > 0.01 ||
+      Math.abs(Number(reportAfter.saldo_final || 0) - reportSubTotalFinal) > 0.01) {
+    throw new Error('Reporte: cuenta no suma sus subcuentas');
   }
   // Reorder y segunda alta sin reemplazar la primera
   const anotherName = 'self-sub-' + Utilities.getUuid().slice(0, 8);
