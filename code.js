@@ -3292,9 +3292,9 @@ function obtenerResumen(anio, mes) {
     });
   }
   // ponytail: balance global al final de cada mes. Partimos del saldo actual
-  // (suma de cuentas) y restamos los movimientos netos de los meses posteriores;
-  // las transferencias no afectan al balance global (mueven entre cuentas).
-  const cuentasAll = filasVisibles_('Cuentas');
+  // (suma de cuentas de activos y pasivos) y restamos los movimientos netos de
+  // los meses posteriores; las transferencias no afectan al balance global.
+  const cuentasAll = filasVisibles_('Cuentas').filter(c => c.tipo === 'activo' || c.tipo === 'pasivo');
   const currentBalance = cuentasAll.reduce((s, c) => s + Number(c.saldo || 0), 0);
   const netByMonth = {};
   txs.forEach(t => {
