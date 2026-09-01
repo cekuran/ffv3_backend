@@ -3291,6 +3291,32 @@ function obtenerResumen(anio, mes) {
               - en.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + impDef(t), 0)
     });
   }
+  // ponytail: balance global al final de cada mes. Partimos del saldo actual
+  // (suma de cuentas) y restamos los movimientos netos de los meses posteriores;
+  // las transferencias no afectan al balance global (mueven entre cuentas).
+  const cuentasAll = filasVisibles_('Cuentas');
+  const currentBalance = cuentasAll.reduce((s, c) => s + Number(c.saldo || 0), 0);
+  const netByMonth = {};
+  txs.forEach(t => {
+    const k = String(t.fecha).slice(0, 7);
+    let delta = 0;
+    if (t.tipo === 'ingreso') delta = impDef(t);
+    else if (t.tipo === 'gasto') delta = -impDef(t);
+    else if (t.tipo === 'devolucion') delta = impDef(t);
+    if (delta !== 0) netByMonth[k] = (netByMonth[k] || 0) + delta;
+  });
+  // ponytail: los meses del rango sin movimientos también deben participar en
+  // el suffix sum; si los dejamos fuera, su futureNet queda en 0 y se subestima
+  // el balance histórico cuando hay txs en meses posteriores.
+  evol.forEach(e => { if (!(e.mes in netByMonth)) netByMonth[e.mes] = 0; });
+  const allMonths = Object.keys(netByMonth).sort();
+  const futureNet = {};
+  let running = 0;
+  for (let i = allMonths.length - 1; i >= 0; i--) {
+    futureNet[allMonths[i]] = running;
+    running += netByMonth[allMonths[i]];
+  }
+  evol.forEach(e => { e.balance = currentBalance - (futureNet[e.mes] || 0); });
   // Próximos recurrentes
   const recs = filasVisibles_('Recurrentes').filter(r => r.activa);
   const proximos = recs.map(r => {
