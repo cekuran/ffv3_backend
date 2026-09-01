@@ -6,13 +6,14 @@ const SCHEMA = {
   Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','establecimiento_id','fecha_creacion'],
   Categorias:    ['owner','id','nombre','color','icono','tipo','orden'],
   Establecimientos:['owner','id','nombre','web'],
-  Transacciones: ['owner','id','fecha','tipo','importe','moneda','importe_en_defecto','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id'],
+  Transacciones: ['owner','id','fecha','tipo','importe','moneda','importe_en_defecto','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id','viaje_id'],
   Recurrentes:   ['owner','id','plantilla','ultima_generacion','activa','mes_inicio','anio_inicio'],
   Presupuestos:  ['owner','id','anio','mes','categoria_id','importe_esperado'],
   Conciliaciones:['owner','id','fecha','cuenta_id','saldo_sistema','saldo_banco','diferencia','notas'],
   TiposCambio:   ['owner','id','fecha','base','destino','ratio'],
   Divisas:       ['owner','id','codigo','nombre','simbolo','por_defecto','activa','orden'],
-  Snapshots:     ['owner','id','fecha_fin','scope','scope_id','saldo','fecha_creacion']
+  Snapshots:     ['owner','id','fecha_fin','scope','scope_id','saldo','fecha_creacion'],
+  Viajes:        ['owner','id','nombre','fecha_inicio','fecha_fin','viatico_diario','notas','fecha_creacion']
 };
 
 const AUTH_SCHEMA = {
@@ -1733,6 +1734,7 @@ const API_ACTIONS = new Set([
   'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar', 'obtenerConciliaciones', 'editarConciliacion', 'eliminarConciliacion',
   'obtenerResumen', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'eliminarTipoCambio', 'obtenerTiposCambio',
   'obtenerDivisas', 'guardarDivisa', 'eliminarDivisa', 'setDivisaPorDefecto',
+  'obtenerViajes', 'guardarViaje', 'eliminarViaje', 'obtenerDetalleViaje', 'vincularTransaccionesViaje',
   'ejecutarSelfTestAdmin', 'ping', 'configurarSpreadsheetMaestro'
 ]);
 
@@ -3544,6 +3546,183 @@ function guardarTipoCambio(base, destino, ratio) {
   if (existenteInversa) inversa.id = existenteInversa.id;
   upsertFila('TiposCambio', inversa);
   return directa;
+}
+
+// ───────── Viajes ─────────
+// ponytail: cada viaje define un rango de fechas y un viático diario. El
+// usuario marca qué transacciones pertenecen al viaje y el endpoint compara
+// gasto real vs (viatico_diario * días) — siempre agregado en importe_en_defecto
+// (o importe si no hay conversión) igual que el resto de resúmenes.
+function viajeResumenFila_(v, txs, moneda) {
+  const inicio = String(v.fecha_inicio || '');
+  const fin = String(v.fecha_fin || '');
+  const viatico = Number(v.viatico_diario || 0);
+  const propias = txs.filter(t => String(t.viaje_id || '') === String(v.id || ''));
+  // Gasto real: solo cuentan gastos (no ingresos/devoluciones/transferencias).
+  const gastoReal = propias
+    .filter(t => String(t.tipo || '') === 'gasto')
+    .reduce((s, t) => s + Number(t.importe_en_defecto || t.importe || 0), 0);
+  // Días del rango, ambos inclusive. Si inicio > fin el rango se considera
+  // vacío (0 días) en vez de tirar error — la UI se encarga de avisar.
+  let dias = 0;
+  if (inicio && fin && String(inicio) <= String(fin)) {
+    const a = parseFecha(inicio);
+    const b = parseFecha(fin);
+    if (a && b) dias = Math.round((b - a) / 86400000) + 1;
+  }
+  const viaticoTotal = viatico * dias;
+  return {
+    id: v.id,
+    nombre: String(v.nombre || ''),
+    fecha_inicio: inicio,
+    fecha_fin: fin,
+    viatico_diario: viatico,
+    notas: String(v.notas || ''),
+    dias: dias,
+    tx_count: propias.length,
+    gasto_real: gastoReal,
+    viatico_total: viaticoTotal,
+    diferencia: viaticoTotal - gastoReal,
+    moneda: moneda || 'EUR'
+  };
+}
+
+function obtenerViajes() {
+  const viajes = leerHoja('Viajes')
+    .map(v => ({
+      id: v.id,
+      nombre: String(v.nombre || ''),
+      fecha_inicio: String(v.fecha_inicio || ''),
+      fecha_fin: String(v.fecha_fin || ''),
+      viatico_diario: Number(v.viatico_diario || 0),
+      notas: String(v.notas || ''),
+      fecha_creacion: String(v.fecha_creacion || '')
+    }))
+    .sort((a, b) => String(b.fecha_inicio || '').localeCompare(String(a.fecha_inicio || '')));
+  const txs = leerHoja('Transacciones');
+  const moneda = codigoDefecto_();
+  return {
+    items: viajes.map(v => viajeResumenFila_(v, txs, moneda)),
+    moneda_por_defecto: moneda
+  };
+}
+
+function guardarViaje(viaje) {
+  if (!viaje) throw new Error('Datos de viaje vacíos');
+  const nombre = String(viaje.nombre || '').trim();
+  if (!nombre) throw new Error('Nombre del viaje obligatorio');
+  const inicio = String(viaje.fecha_inicio || '').trim();
+  const fin = String(viaje.fecha_fin || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(inicio)) throw new Error('Fecha de inicio inválida');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fin)) throw new Error('Fecha de fin inválida');
+  if (inicio > fin) throw new Error('La fecha de inicio no puede ser posterior a la de fin');
+  const viatico = Number(viaje.viatico_diario || 0);
+  if (!(viatico >= 0)) throw new Error('Viático diario debe ser ≥ 0');
+  const filas = leerHoja('Viajes');
+  const existente = viaje.id ? filas.find(v => v.id === viaje.id) : null;
+  const fila = {
+    owner: (existente && existente.owner) || username_(),
+    id: existente ? existente.id : uid_('via'),
+    nombre: nombre,
+    fecha_inicio: inicio,
+    fecha_fin: fin,
+    viatico_diario: viatico,
+    notas: String(viaje.notas || '').trim(),
+    fecha_creacion: existente ? (existente.fecha_creacion || isoAhora_()) : isoAhora_()
+  };
+  upsertFila('Viajes', fila);
+  return obtenerViajes();
+}
+
+function eliminarViaje(id) {
+  const idStr = String(id || '').trim();
+  if (!idStr) throw new Error('Indica el viaje');
+  const filas = leerHoja('Viajes');
+  if (!filas.some(v => v.id === idStr)) throw new Error('Viaje no encontrado');
+  escribirHoja('Viajes', filas.filter(v => v.id !== idStr));
+  // Limpiar viaje_id en transacciones que apuntaban aquí.
+  const txs = leerHoja('Transacciones').map(t => {
+    if (String(t.viaje_id || '') !== idStr) return t;
+    return Object.assign({}, t, { viaje_id: '' });
+  });
+  escribirHoja('Transacciones', txs);
+  return obtenerViajes();
+}
+
+function obtenerDetalleViaje(id) {
+  const idStr = String(id || '').trim();
+  if (!idStr) throw new Error('Indica el viaje');
+  const v = leerHoja('Viajes').find(x => x.id === idStr);
+  if (!v) throw new Error('Viaje no encontrado');
+  const txs = leerHoja('Transacciones').filter(t => String(t.fecha || '') >= String(v.fecha_inicio || '') && String(t.fecha || '') <= String(v.fecha_fin || ''));
+  const moneda = codigoDefecto_();
+  const resumen = viajeResumenFila_(v, txs, moneda);
+  // Breakdown diario: una fila por día en el rango, con el total de gastos del
+  // día (sólo los del viaje) y el saldo contra el viático diario.
+  const inicio = parseFecha(v.fecha_inicio);
+  const fin = parseFecha(v.fecha_fin);
+  const dias = [];
+  if (inicio && fin && inicio <= fin) {
+    for (let d = new Date(inicio); d <= fin; d.setDate(d.getDate() + 1)) {
+      const iso = Utilities.formatDate(d, tz_(), 'yyyy-MM-dd');
+      const propias = txs.filter(t => String(t.viaje_id || '') === idStr && String(t.fecha || '') === iso);
+      const gasto = propias
+        .filter(t => String(t.tipo || '') === 'gasto')
+        .reduce((s, t) => s + Number(t.importe_en_defecto || t.importe || 0), 0);
+      dias.push({
+        fecha: iso,
+        viatico_diario: Number(v.viatico_diario || 0),
+        gasto_real: gasto,
+        diferencia: Number(v.viatico_diario || 0) - gasto,
+        tx_ids: propias.map(t => t.id)
+      });
+    }
+  }
+  return Object.assign({}, resumen, {
+    notas: String(v.notas || ''),
+    dias: dias,
+    transacciones_en_rango: txs.map(t => ({
+      id: t.id,
+      fecha: String(t.fecha || ''),
+      tipo: String(t.tipo || ''),
+      descripcion: String(t.descripcion || ''),
+      importe: Number(t.importe || 0),
+      importe_en_defecto: Number(t.importe_en_defecto || t.importe || 0),
+      moneda: String(t.moneda || moneda),
+      categoria_id: String(t.categoria_id || ''),
+      cuenta_id: String(t.cuenta_id || ''),
+      viaje_id: String(t.viaje_id || '')
+    }))
+  });
+}
+
+// ponytail: vincula/desvincula en bloque. Pasamos la lista COMPLETA de tx del
+// viaje (no deltas) para que el cliente pueda alternar checkboxes sin pedir
+// diffs al servidor; el servidor reconcilia contra lo que ya estaba.
+function vincularTransaccionesViaje(viajeId, txIds) {
+  const idStr = String(viajeId || '').trim();
+  if (!idStr) throw new Error('Indica el viaje');
+  const v = leerHoja('Viajes').find(x => x.id === idStr);
+  if (!v) throw new Error('Viaje no encontrado');
+  const wanted = new Set((Array.isArray(txIds) ? txIds : []).map(x => String(x || '')).filter(Boolean));
+  const txs = leerHoja('Transacciones');
+  // Sólo se vinculan transacciones dentro del rango del viaje; el resto se
+  // desvincula si estuviera apuntando aquí (p.ej. si alguien cambió el rango).
+  const inicio = String(v.fecha_inicio || '');
+  const fin = String(v.fecha_fin || '');
+  let changed = 0;
+  const actualizadas = txs.map(t => {
+    if (String(t.viaje_id || '') === idStr || (wanted.has(String(t.id || '')) && String(t.fecha || '') >= inicio && String(t.fecha || '') <= fin)) {
+      const shouldHave = wanted.has(String(t.id || '')) && String(t.fecha || '') >= inicio && String(t.fecha || '') <= fin;
+      const actual = String(t.viaje_id || '') === idStr;
+      if (shouldHave === actual) return t;
+      changed++;
+      return Object.assign({}, t, { viaje_id: shouldHave ? idStr : '' });
+    }
+    return t;
+  });
+  if (changed) escribirHoja('Transacciones', actualizadas);
+  return obtenerDetalleViaje(idStr);
 }
 
 // ───────── Self-test mínimo ─────────
