@@ -2457,6 +2457,29 @@ function obtenerTransacciones(filtro) {
     .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
 }
 
+// ponytail: dedupe on create-only. Mismo tipo + día exacto + cuenta + sub +
+// importe + descripción (trim+lowercase). Editar una tx existente NO dispara
+// el check; el caller puede saltarlo con force_duplicate=true si confirma.
+function detectarDuplicadoTx_(tx, existente) {
+  if (existente) return null;
+  if (tx && tx.force_duplicate === true) return null;
+  const tipo = String(tx && tx.tipo || '');
+  const fecha = String(tx && tx.fecha || '').slice(0, 10);
+  const cuenta = String(tx && tx.cuenta_id || '');
+  const sub = String(tx && tx.subcuenta_id || '');
+  const imp = Number(tx && tx.importe);
+  const desc = String(tx && tx.descripcion || '').trim().toLowerCase();
+  if (!tipo || !fecha || !cuenta || !(imp > 0) || !desc) return null;
+  return leerHoja('Transacciones').find(t =>
+    t.tipo === tipo &&
+    String(t.fecha || '').slice(0, 10) === fecha &&
+    String(t.cuenta_id || '') === cuenta &&
+    String(t.subcuenta_id || '') === sub &&
+    Math.abs(Number(t.importe) - imp) < 0.005 &&
+    String(t.descripcion || '').trim().toLowerCase() === desc
+  ) || null;
+}
+
 function guardarTransaccion(tx) {
   const owner = username_();
   const actor = requireUsuario_();
@@ -2470,6 +2493,14 @@ function guardarTransaccion(tx) {
   const txs = leerHoja('Transacciones');
   const existente = tx.id ? txs.find(t => t.id === tx.id) : null;
   if (tx.id && !existente) throw new Error('Transacción no encontrada');
+  const dupTx = detectarDuplicadoTx_(tx, existente);
+  if (dupTx) {
+    throw new Error('DUPLICATE:' + JSON.stringify({
+      tipo: 'transaccion',
+      mensaje: 'Ya existe una transacción con la misma fecha, cuenta, importe y descripción.',
+      existente: dupTx
+    }));
+  }
   // Concurrencia optimista: si el cliente envía la fecha_ultima_edicion que
   // conocía al abrir el formulario y el servidor tiene otra, hay conflicto.
   if (existente && tx.base_fecha_ultima_edicion != null && tx.base_fecha_ultima_edicion !== '') {
@@ -2885,6 +2916,29 @@ function validarPlantillaRecurrente_(owner, plantilla) {
   return p;
 }
 
+// ponytail: dedupe on create-only. Mismo tipo + cuenta + importe + descripción
+// + periodo_meses dentro de la plantilla. Editar un recurrente existente NO
+// dispara el check; el caller puede saltarlo con force_duplicate=true.
+function detectarDuplicadoRec_(rec, existente, plantilla) {
+  if (existente) return null;
+  if (rec && rec.force_duplicate === true) return null;
+  if (!plantilla) return null;
+  const tipo = String(plantilla.tipo || '');
+  const cuenta = String(plantilla.cuenta_id || '');
+  const imp = Number(plantilla.importe);
+  const desc = String(plantilla.descripcion || '').trim().toLowerCase();
+  const periodo = Number(plantilla.periodo_meses || 1);
+  if (!tipo || !cuenta || !(imp > 0) || !desc) return null;
+  return leerHoja('Recurrentes').find(r => {
+    let p; try { p = JSON.parse(r.plantilla); } catch (_) { return false; }
+    return String(p.tipo || '') === tipo &&
+      String(p.cuenta_id || '') === cuenta &&
+      Math.abs(Number(p.importe) - imp) < 0.005 &&
+      String(p.descripcion || '').trim().toLowerCase() === desc &&
+      Number(p.periodo_meses || 1) === periodo;
+  }) || null;
+}
+
 function guardarRecurrente(rec) {
   const owner = username_();
   if (!rec.plantilla) throw new Error('Falta plantilla');
@@ -2892,6 +2946,16 @@ function guardarRecurrente(rec) {
   validarPlantillaRecurrente_(owner, plantilla);
   const datos = leerHoja('Recurrentes');
   const existente = rec.id ? datos.find(r => r.id === rec.id) : null;
+  const dupRec = detectarDuplicadoRec_(rec, existente, plantilla);
+  if (dupRec) {
+    let dupPlantilla = {};
+    try { dupPlantilla = JSON.parse(dupRec.plantilla); } catch (_) { /* keep empty */ }
+    throw new Error('DUPLICATE:' + JSON.stringify({
+      tipo: 'recurrente',
+      mensaje: 'Ya existe un recurrente con la misma cuenta, importe, descripción y periodicidad.',
+      existente: Object.assign({}, dupRec, { plantilla: dupPlantilla })
+    }));
+  }
   // ponytail: mes_inicio/anio_inicio se aceptan como columnas propias o como
   // campos dentro de la plantilla; lo que llegue escrito gana. Si no llegan
   // ni en payload ni en la plantilla, conservan lo que ya tenía la fila.
