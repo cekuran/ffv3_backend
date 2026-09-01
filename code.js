@@ -1372,6 +1372,7 @@ function generarSnapshotsParaFechas_(fechaFins) {
     cuentas.filter(s => s.parent_id === c.id).forEach(s => {
       scopes.push({
         scope: 'subcuenta', scope_id: s.id,
+        defaultSubId: cuentas.filter(x => x.parent_id === s.parent_id)[0]?.id || '',
         saldo: Number(s.saldo_inicial || 0)
       });
     });
@@ -1392,7 +1393,7 @@ function generarSnapshotsParaFechas_(fechaFins) {
     while (txIdx < txs.length && String(txs[txIdx].fecha) <= me) {
       const t = txs[txIdx];
       scopes.forEach(sk => {
-        sk.saldo += deltaSubcuenta_(t, sk.scope_id);
+        sk.saldo += deltaSubcuenta_(t, sk.scope_id, sk.defaultSubId);
       });
       txIdx++;
     }
@@ -1465,11 +1466,11 @@ function scopesAfectadosPorTx_(t) {
 }
 
 // Devuelve el delta que una tx aporta a un scope concreto.
-function deltaScope_(t, scope, scopeId) {
+function deltaScope_(t, scope, scopeId, defaultSubId) {
   if (!t) return 0;
   return scope === 'cuenta'
     ? deltaCuenta_(t, scopeId)
-    : deltaSubcuenta_(t, scopeId);
+    : deltaSubcuenta_(t, scopeId, defaultSubId);
 }
 
 // Aplica el cambio de una tx (alta, edición o baja) sobre todos los snapshots
@@ -1477,18 +1478,30 @@ function deltaScope_(t, scope, scopeId) {
 function ajustarSnapshotsPorCambioTx_(txAnterior, txNuevo) {
   const snapshots = leerSnapshots_();
   if (!snapshots.length) return;
+  const cuentas = leerHoja('Cuentas');
+  const defaultSubByParent = {};
 
   const aplicar = (t, signo) => {
     if (!t) return;
     const txFecha = String(t.fecha || '');
     if (!txFecha) return;
     const affected = scopesAfectadosPorTx_(t);
+    if (t.cuenta_id && !t.subcuenta_id) {
+      if (!defaultSubByParent[t.cuenta_id]) {
+        defaultSubByParent[t.cuenta_id] = cuentas.filter(c => c.parent_id === t.cuenta_id)[0] || null;
+      }
+      const defaultSub = defaultSubByParent[t.cuenta_id];
+      if (defaultSub) affected.push('subcuenta:' + defaultSub.id);
+    }
     const affectedSet = new Set(affected);
     snapshots.forEach(snap => {
       if (String(snap.fecha_fin) < txFecha) return;
       const key = snap.scope + ':' + snap.scope_id;
       if (!affectedSet.has(key)) return;
-      const d = deltaScope_(t, snap.scope, snap.scope_id);
+      const defaultSubId = snap.scope === 'subcuenta' && t.cuenta_id && !t.subcuenta_id
+        ? (defaultSubByParent[t.cuenta_id] && defaultSubByParent[t.cuenta_id].id) || ''
+        : '';
+      const d = deltaScope_(t, snap.scope, snap.scope_id, defaultSubId);
       snap.saldo = Number((Number(snap.saldo || 0) + signo * d).toFixed(2));
     });
   };
@@ -1940,6 +1953,7 @@ function obtenerCuentas() {
     // c.saldo_inicial propio del padre se trata como metadato: si era > 0,
     // distribúyelo a la subcuenta que corresponda antes de este cambio (ya
     // no se refleja en cuenta.saldo para que coincida con sum(subs)).
+    const defaultSubId = subs[0] && subs[0].id;
     const subcuentas = subs.map(s => {
       const subInitial = Number(s.saldo_inicial || 0);
       // ponytail: devoluciones con destino también imputan a la subcuenta
@@ -1948,14 +1962,14 @@ function obtenerCuentas() {
       // saldo de la subcuenta destino.
       const subDelta = liveTxs
         .filter(t => {
-          const origenOk = t.subcuenta_id === s.id && t.cuenta_id === c.id;
+          const origenOk = (t.subcuenta_id || defaultSubId) === s.id && t.cuenta_id === c.id;
           if (origenOk) return true;
           if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
           const reparto = parseRepartoDestino_(t.reparto_destino);
           if (reparto.length) return reparto.some(r => r.subcuenta_id === s.id);
           return t.subcuenta_destino_id === s.id;
         })
-        .reduce((sum, t) => sum + deltaSubcuenta_(t, s.id), 0);
+        .reduce((sum, t) => sum + deltaSubcuenta_(t, s.id, defaultSubId), 0);
       const anchorSub = snapByKey[anchorFechaFin + '|subcuenta:' + s.id];
       const anchorSubSaldo = anchorSub != null ? anchorSub : subInitial;
       return {
@@ -1997,13 +2011,13 @@ function obtenerCuentas() {
           const live = liveTxs
             .filter(t => {
               if (String(t.fecha) > lastDayK) return false;
-              if (t.subcuenta_id === sub.id && t.cuenta_id === c.id) return true;
+              if ((t.subcuenta_id || defaultSubId) === sub.id && t.cuenta_id === c.id) return true;
               if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
               const reparto = parseRepartoDestino_(t.reparto_destino);
               if (reparto.length) return reparto.some(r => r.subcuenta_id === sub.id);
               return t.subcuenta_destino_id === sub.id;
             })
-            .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id), 0);
+            .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id, defaultSubId), 0);
           // delta respecto al inicial: lo que se mueve esta sub en (anchor, lastDayK].
           return s + (baseVal + live - Number(sub.saldo_inicial || 0));
         }, 0);
@@ -2048,10 +2062,11 @@ function deltaCuenta_(t, cuentaId) {
 // destino restan de la subcuenta de origen (subcuenta_id) y suman a la de
 // destino: si hay reparto_destino (JSON con varias subcuentas) se reparte;
 // si no, se usa el legado subcuenta_destino_id único.
-function deltaSubcuenta_(t, subId) {
+function deltaSubcuenta_(t, subId, defaultSubId) {
   let d = 0;
   const devolConDestino = t.tipo === 'devolucion' && t.cuenta_destino_id;
-  if (t.subcuenta_id === subId) {
+  const subOrigen = t.subcuenta_id || defaultSubId || '';
+  if (subOrigen === subId) {
     if (devolConDestino) d += -Number(t.importe || 0);
     else if (t.tipo === 'ingreso' || t.tipo === 'devolucion') d += Number(t.importe || 0);
     else if (t.tipo === 'gasto' || t.tipo === 'transferencia') d += -Number(t.importe || 0);
@@ -2080,6 +2095,13 @@ function normalizarSubcuentasHuerfanas_() {
   let cambios = false;
   const txs = leerHoja('Transacciones').map(t => {
     let nuevo = t;
+    if (!nuevo.subcuenta_id && nuevo.cuenta_id) {
+      const defaultSub = cuentas.find(c => c.parent_id === nuevo.cuenta_id);
+      if (defaultSub) {
+        nuevo = Object.assign({}, nuevo, { subcuenta_id: defaultSub.id });
+        cambios = true;
+      }
+    }
     if (t.subcuenta_id && !validas.has(t.cuenta_id + '|' + t.subcuenta_id)) {
       cambios = true;
       nuevo = Object.assign({}, nuevo, { subcuenta_id: '' });
@@ -3068,6 +3090,7 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
       const corte = new Date(fechaCorte.getFullYear(), fechaCorte.getMonth(), fechaCorte.getDate());
       while (cursor <= corte) {
         const isoCursor = iso_(cursor);
+        const defaultSubId = cuentasHoja.find(c => c.parent_id === p.cuenta_id)?.id || '';
         // ponytail: idempotencia robusta. Match por (recurrente_id, mes) o
         // por (mes, cuenta, importe, descripcion) para no duplicar el
         // "original" manual previo sin recurrente_id.
@@ -3081,7 +3104,7 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
             // convierte en EUR al materializarse.
             moneda: String(p.moneda || '').toUpperCase() || (cuentasHoja.find(c => c.id === p.cuenta_id) || {}).moneda || codigoDefecto_(),
             cuenta_id: p.cuenta_id,
-            subcuenta_id: p.subcuenta_id || '',
+            subcuenta_id: p.subcuenta_id || defaultSubId,
             cuenta_destino_id: p.cuenta_destino_id || '',
             subcuenta_destino_id: p.subcuenta_destino_id || '',
             importe_destino: p.importe_destino || '',
@@ -3490,7 +3513,7 @@ function obtenerReporteMensual(anio, mes) {
     if (fecha > anchorFechaFin) anchorFechaFin = fecha;
   });
 
-  function saldoSubHasta_(sub, fecha) {
+  function saldoSubHasta_(sub, fecha, defaultSubId) {
     const fin = String(fecha || '');
     const subId = String(sub.id);
     const snap = snapByKey[fin + '|subcuenta:' + subId];
@@ -3502,7 +3525,7 @@ function obtenerReporteMensual(anio, mes) {
     const desde = anchor != null && fin > anchorFechaFin ? anchorFechaFin : '';
     return base + todasTxs
       .filter(t => (!desde || String(t.fecha) > desde) && String(t.fecha) <= fin)
-      .reduce((s, t) => s + deltaSubcuenta_(t, subId), 0);
+      .reduce((s, t) => s + deltaSubcuenta_(t, subId, defaultSubId), 0);
   }
 
   function afectaCuenta_(tx, cuenta) {
@@ -3510,8 +3533,8 @@ function obtenerReporteMensual(anio, mes) {
     return (tx.tipo === 'transferencia' || tx.tipo === 'devolucion') && tx.cuenta_destino_id === cuenta.id;
   }
 
-  function afectaSubcuenta_(tx, sub, parentId) {
-    if (tx.subcuenta_id === sub.id && tx.cuenta_id === parentId) return true;
+  function afectaSubcuenta_(tx, sub, parentId, defaultSubId) {
+    if ((tx.subcuenta_id || defaultSubId) === sub.id && tx.cuenta_id === parentId) return true;
     if (tx.cuenta_destino_id !== parentId || (tx.tipo !== 'transferencia' && tx.tipo !== 'devolucion')) return false;
     const reparto = parseRepartoDestino_(tx.reparto_destino);
     return reparto.length
@@ -3521,14 +3544,17 @@ function obtenerReporteMensual(anio, mes) {
 
   const cuentasReporte = top.map(cuenta => {
     const subcuentas = cuentas.filter(c => c.parent_id === cuenta.id);
-    const subReporte = subcuentas.map(sub => ({
+    const subReporte = subcuentas.map(sub => {
+      const defaultSubId = cuentas.filter(s => s.parent_id === sub.parent_id)[0]?.id;
+      return {
       id: sub.id,
       nombre: sub.nombre,
       parent_id: sub.parent_id,
-      saldo_inicial: saldoSubHasta_(sub, inicioAnterior),
-      saldo_final: saldoSubHasta_(sub, hasta),
-      movimientos: txs.filter(t => afectaSubcuenta_(t, sub, cuenta.id))
-    }));
+      saldo_inicial: saldoSubHasta_(sub, inicioAnterior, defaultSubId),
+      saldo_final: saldoSubHasta_(sub, hasta, defaultSubId),
+      movimientos: txs.filter(t => afectaSubcuenta_(t, sub, cuenta.id, defaultSubId))
+      };
+    });
     return {
       id: cuenta.id,
       nombre: cuenta.nombre,
