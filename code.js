@@ -3076,21 +3076,21 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
         const curY = base.getFullYear() * 12 + base.getMonth();
         if (curY < minY) base = new Date(anioIniRaw, mesIniRaw - 1, 1);
       }
-      // Primera ocurrencia del día en el mes de base (o último día del mes si no existe).
-      let cursor = fechaConDiaMes_(base.getFullYear(), base.getMonth(), dia);
-      // Si esa fecha ya quedó cubierta por ultima_generacion, avanzar periodos
-      // hasta pasar de ella (evita regenerar meses anteriores). Comprobamos con
-      // `<` y no `<=` porque ultima_generacion es el cutoff del último run —
-      // no necesariamente el slot real generado. Si el cutoff cayó en el mismo
-      // día del cargo, `<=` avanza el cursor y se salta ese slot, dejándolo
-      // sin generar aunque ya haya pasado. El segundo while +
-      // txConflictaEnMesRecurrente_ cubren el caso "mismo día" con
-      // idempotencia.
-      if (r.ultima_generacion) {
-        const uIso = iso_(base);
-        while (iso_(cursor) < uIso && cursor <= fechaCorte) {
-          cursor = siguienteCursor_(cursor, periodo, dia);
-        }
+      // Sembrar el cursor con la FASE anclada a `inicio` (día dia_mes cada
+      // `periodo` meses desde el mes de inicio) y avanzar por periodos completos
+      // solo mientras el cursor esté en un MES estrictamente anterior al de
+      // `base` (ultima_generacion / mes_inicio). Comparar por MES —y no por
+      // fecha completa— corrige el bug de saltarse el cargo del mes en curso
+      // cuando ultima_generacion (el cutoff del último run) cae más tarde en el
+      // mes que el día del cargo (p. ej. cargo día 3, último run día 7: el
+      // cursor no debe saltar al mes siguiente). Anclar la fase a `inicio`
+      // mantiene correctos los periodos > 1 mes aunque el último run cayera en
+      // un mes fuera de fase. El segundo while + txConflictaEnMesRecurrente_
+      // garantizan idempotencia.
+      let cursor = fechaConDiaMes_(inicio.getFullYear(), inicio.getMonth(), dia);
+      const baseMesIdx = base.getFullYear() * 12 + base.getMonth();
+      while ((cursor.getFullYear() * 12 + cursor.getMonth()) < baseMesIdx && cursor <= fechaCorte) {
+        cursor = siguienteCursor_(cursor, periodo, dia);
       }
       // Normalizar corte a medianoche local para comparación de día fiable.
       const corte = new Date(fechaCorte.getFullYear(), fechaCorte.getMonth(), fechaCorte.getDate());

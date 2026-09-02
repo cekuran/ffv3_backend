@@ -33,19 +33,18 @@ function parseFecha(s) {
   return null;
 }
 
-function simular(ultimaGeneracion, dia, periodoMeses, fechaCorte) {
+function simular(ultimaGeneracion, dia, periodoMeses, fechaCorte, inicioStr) {
   const base = parseFecha(ultimaGeneracion) || new Date();
-  let cursor = fechaConDiaMes_(base.getFullYear(), base.getMonth(), dia);
-  // PRIMER while (idéntico al código)
-  const uIso = iso_(base);
-  // FIX: usar `<` en lugar de `<=`. La condición `<=` avanza el cursor también
-  // cuando el slot está en el mismo día del último cutoff, saltándose ese slot
-  // incluso si nunca fue generado (caso típico: bootstrap previo fue el mismo
-  // día del cargo; el primer while salta sep 5 → oct 5 y la tx de sep 5 nunca
-  // se crea). El `<` mantiene la optimización de no re-chequear slots
-  // estrictamente anteriores y deja que el segundo while + chequeo de
-  // conflicto (`txConflictaEnMesRecurrente_`) decidan sobre el slot del día.
-  while (iso_(cursor) < uIso && cursor <= fechaCorte) {
+  // inicio ancla la fase; por defecto asumimos un inicio anterior al cutoff.
+  const inicio = parseFecha(inicioStr) || new Date(base.getFullYear() - 1, base.getMonth(), dia);
+  // PRIMER while (idéntico al código): sembrar con la fase anclada a `inicio` y
+  // avanzar por periodos completos mientras el cursor esté en un MES
+  // estrictamente anterior al de `base`. Comparar por MES —no por fecha
+  // completa— evita saltarse el cargo del mes en curso cuando ultima_generacion
+  // cae más tarde en el mes que el día del cargo (cargo día 3, último run día 7).
+  let cursor = fechaConDiaMes_(inicio.getFullYear(), inicio.getMonth(), dia);
+  const baseMesIdx = base.getFullYear() * 12 + base.getMonth();
+  while ((cursor.getFullYear() * 12 + cursor.getMonth()) < baseMesIdx && cursor <= fechaCorte) {
     cursor = siguienteCursor_(cursor, periodoMeses, dia);
   }
   // SEGUNDO while
@@ -115,6 +114,37 @@ if (!rReporte.includes('2026-09-05')) {
 console.log('  cortes generados:', rReporte);
 console.log('  ✓ cargo día 5 generado aunque el último cutoff fue ese mismo día');
 
+// CASO REPORTE 2: cargo día 3, hoy día 7, el último bootstrap corrió el día 7
+// (o el día 5, más tarde en el mes que el día del cargo) y dejó el cutoff ahí.
+// El slot del día 3 debe generarse porque ya pasó. Con la comparación por
+// fecha completa (`<`), el cursor saltaba a octubre y el día 3 no se cargaba.
+console.log();
+console.log('CASO REPORTE 2 — cargo día 3, hoy día 7, último cutoff más tarde en el mes:');
+[['2026-09-07', 'cutoff = hoy (día 7)'], ['2026-09-05', 'cutoff = día 5']].forEach(([cutoff, etiqueta]) => {
+  const rr = simular(cutoff, 3, 1, new Date(2026, 8, 7), '2026-01-03');
+  if (!rr.includes('2026-09-03')) {
+    console.error('FAIL: no generó el cargo del día 3 (' + etiqueta + ')');
+    process.exit(1);
+  }
+  if (rr.some(c => c > '2026-09-07')) {
+    console.error('FAIL: generó cargos futuros (' + etiqueta + '): ' + JSON.stringify(rr));
+    process.exit(1);
+  }
+  console.log('  ' + etiqueta + ' → cortes:', rr, '✓');
+});
+
+// CASO REPORTE 3: periodo 2 meses (bimestral) con inicio en enero (meses en
+// fase: ene, mar, may, jul, sep...). El último bootstrap cayó en octubre (mes
+// FUERA de fase). El próximo cargo válido a generar/backfill es el de sep 3, no
+// uno en octubre. Anclar la fase a `inicio` evita generar en meses fuera de fase.
+console.log();
+console.log('CASO REPORTE 3 — bimestral en fase impar, último run en mes par:');
+const rBi = simular('2026-10-15', 3, 2, new Date(2026, 9, 20), '2026-01-03');
+if (rBi.some(c => c.slice(5, 7) === '10' || c.slice(5, 7) === '08')) {
+  console.error('FAIL: generó cargo en mes fuera de fase (bimestral): ' + JSON.stringify(rBi));
+  process.exit(1);
+}
+console.log('  cortes generados:', rBi, '(sin meses pares) ✓');
+
 console.log();
 console.log('Todos los casos pasaron.');
-
