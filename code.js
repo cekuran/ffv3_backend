@@ -3079,10 +3079,16 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
       // Primera ocurrencia del día en el mes de base (o último día del mes si no existe).
       let cursor = fechaConDiaMes_(base.getFullYear(), base.getMonth(), dia);
       // Si esa fecha ya quedó cubierta por ultima_generacion, avanzar periodos
-      // hasta pasar de ella (evita regenerar el mismo mes).
+      // hasta pasar de ella (evita regenerar meses anteriores). Comprobamos con
+      // `<` y no `<=` porque ultima_generacion es el cutoff del último run —
+      // no necesariamente el slot real generado. Si el cutoff cayó en el mismo
+      // día del cargo, `<=` avanza el cursor y se salta ese slot, dejándolo
+      // sin generar aunque ya haya pasado. El segundo while +
+      // txConflictaEnMesRecurrente_ cubren el caso "mismo día" con
+      // idempotencia.
       if (r.ultima_generacion) {
         const uIso = iso_(base);
-        while (iso_(cursor) <= uIso && cursor <= fechaCorte) {
+        while (iso_(cursor) < uIso && cursor <= fechaCorte) {
           cursor = siguienteCursor_(cursor, periodo, dia);
         }
       }
@@ -4364,6 +4370,47 @@ function __selfTestBody_(owner) {
   // Limpieza
   eliminarRecurrente(recIdOriginal);
   eliminarTransaccion(txRec.id);
+
+  // ponytail: regresión — si el último cutoff cayó en el mismo día del cargo
+  // del recurrente, abrir la app varios días después debe materializar igual
+  // el slot intermedio. Antes el primer while usaba `<=` y saltaba el slot
+  // cuyo día coincidía con ultima_generacion, dejándolo sin generar.
+  const recBackId = 'rec_backfill_' + Utilities.getUuid().slice(0, 8);
+  const descBack = 'self-backfill-' + Utilities.getUuid().slice(0, 8);
+  // ultima_generacion = fecha actual (simula un bootstrap previo ese mismo
+  // día que dejó el cutoff en hoy). Como ese run anterior ya consumió el
+  // slot de hoy (con el bug viejo lo hubiera saltado; con el fix lo genera),
+  // pre-creamos manualmente una tx hoy con este recurrente_id para que el
+  // chequeo de conflicto lo detecte como ya materializado. Después
+  // retrocedemos artificialmente el cutoff a 5 días atrás y borramos esa tx;
+  // eso deja el slot sin generar y el cursor exactamente en el caso
+  // reportado: "5 días después del cargo, todavía sin transacción".
+  guardarRecurrente({
+    id: recBackId,
+    plantilla: {
+      tipo: 'gasto', importe: 11, cuenta_id: cuentas[0].id, categoria_id: cat[0].id,
+      descripcion: descBack,
+      periodo_meses: 1, dia_mes: 5, inicio: '2026-01-05'
+    },
+    ultima_generacion: '', activa: true
+  });
+  // Simulamos el escenario: hoy día 10 (5 días pasado el cargo día 5),
+  // ultima_generacion quedó en día 5 porque el último bootstrap corrió ese día.
+  const hoy10 = new Date(2026, 8, 10);
+  const recBack = leerHoja('Recurrentes').find(r => r.id === recBackId);
+  recBack.ultima_generacion = '2026-09-05';
+  escribirHoja('Recurrentes', leerHoja('Recurrentes').map(r => r.id === recBackId ? recBack : r));
+  generarRecurrentesPendientes_(owner, hoy10);
+  const txsBack = leerHoja('Transacciones').filter(t => t.owner === owner && t.recurrente_id === recBackId);
+  const sep5 = txsBack.find(t => t.fecha === '2026-09-05');
+  if (!sep5) throw new Error('Regresión backfill: no generó tx del día del cargo 5 días después');
+  // Idempotencia: segunda corrida no debe duplicar
+  generarRecurrentesPendientes_(owner, hoy10);
+  const txsBack2 = leerHoja('Transacciones').filter(t => t.owner === owner && t.recurrente_id === recBackId && t.fecha === '2026-09-05');
+  if (txsBack2.length !== 1) throw new Error('Regresión backfill: duplicó tx en segunda corrida (' + txsBack2.length + ')');
+  // Limpieza
+  txsBack2.forEach(t => eliminarTransaccion(t.id));
+  eliminarRecurrente(recBackId);
 
   // ponytail: smoke-test de devoluciones — verifica que la categoría de gasto
   // queda como real = gasto_original − devolucion, y que el saldo de la cuenta
