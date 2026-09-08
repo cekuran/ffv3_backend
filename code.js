@@ -3315,11 +3315,20 @@ function obtenerResumen(anio, mes) {
     // el mes anterior si la hoja estaba en UTC; los slice(0,7) de txs almacenados no matcheaban
     const k = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
     const en = txs.filter(t => String(t.fecha).slice(0, 7) === k);
+    // ponytail: gastos/ingresos = flujo real (gasto − devolución). Los *Presupuesto
+    // añaden las transferencias que la sección Presupuesto cuenta como gasto/ingreso,
+    // para que el gráfico de Evolución cuadre con esas tarjetas en todos los meses.
+    const gEvol = en.filter(t => t.tipo === 'gasto').reduce((s, t) => s + impDef(t), 0)
+                - en.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + impDef(t), 0);
+    const iEvol = en.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + impDef(t), 0);
+    const tGastoEvol = en.filter(t => t.tipo === 'transferencia' && tipoTransferenciaPresupuestoTx_(t, cuentasById) === 'gasto').reduce((s, t) => s + impDef(t), 0);
+    const tIngresoEvol = en.filter(t => t.tipo === 'transferencia' && tipoTransferenciaPresupuestoTx_(t, cuentasById) === 'ingreso').reduce((s, t) => s + impDef(t), 0);
     evol.push({
       mes: k,
-      ingresos: en.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + impDef(t), 0),
-      gastos: en.filter(t => t.tipo === 'gasto').reduce((s, t) => s + impDef(t), 0)
-              - en.filter(t => t.tipo === 'devolucion').reduce((s, t) => s + impDef(t), 0)
+      ingresos: iEvol,
+      gastos: gEvol,
+      ingresosPresupuesto: iEvol + tIngresoEvol,
+      gastosPresupuesto: gEvol + tGastoEvol
     });
   }
   // ponytail: balance global al final de cada mes. Partimos del saldo actual
