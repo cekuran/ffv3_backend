@@ -3289,10 +3289,12 @@ function obtenerResumen(anio, mes) {
   // distinta a la por defecto; usamos importe_en_defecto (autocalculado al
   // guardar la tx) y, si la fila es legacy y no lo tiene, caemos a importe.
   const impDef = t => Number(t.importe_en_defecto != null && t.importe_en_defecto !== '' ? t.importe_en_defecto : (t.importe || 0));
-  const enMes = txs.filter(t => {
-    const f = new Date(t.fecha);
-    return f.getFullYear() === Number(a) && (f.getMonth() + 1) === Number(m);
-  });
+  // ponytail: filtramos por comparación de string 'yyyy-MM' (las fechas se
+  // normalizan a ese formato en leerHoja) en vez de new Date()+getMonth(): esto
+  // último parsea en UTC y, para txs del día 1, podía caer en el mes anterior en
+  // zonas horarias negativas, desalineando el KPI del top-level respecto al evol.
+  const periodo = Number(a) + '-' + String(m).padStart(2, '0');
+  const enMes = txs.filter(t => String(t.fecha).slice(0, 7) === periodo);
   const ingresos = enMes.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + impDef(t), 0);
   const gastos = enMes.filter(t => t.tipo === 'gasto').reduce((s, t) => s + impDef(t), 0);
   // ponytail: devoluciones restan del total de gastos del mes (revierte gastos).
