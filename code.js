@@ -20,7 +20,7 @@ const AUTH_SCHEMA = {
   Usuarios: ['username','password_hash','salt','rol','activo','fecha_creacion'],
   Spreadsheets: ['spreadsheet_id','nombre','descripcion','fecha_alta'],
   HojasUsuarios: ['username','spreadsheet_id','por_defecto','fecha_alta'],
-  Tokens: ['token','username','fecha_creacion'],
+  Tokens: ['token','username','fecha_creacion','expira'],
   Config: ['clave','valor']
 };
 const ROLES = { ADMIN: 'admin', BASICO: 'basico' };
@@ -94,6 +94,13 @@ const CACHE_TTL_TOKEN_SEC = 30 * 60;       // 30 min — validación de sesión
 const CACHE_TTL_AUTH_SHEET_SEC = 5 * 60;   // 5 min — hojas del spreadsheet maestro
 const CACHE_TTL_SALDOS_SEC = 10 * 60;      // 10 min — saldos/evolución de cuentas
 const CACHE_MAX_JSON_CHARS = 90000;        // margen bajo el límite ~100 KB
+
+// Tokens de sesión: caducan a los 30 días sin uso (renovación deslizante al
+// validar, amortizada a 1 escritura por media vida). La hoja Tokens se
+// compacta en cada login/validación descartando filas vencidas: cada login
+// reescribe la hoja completa, así que mantenerla pequeña es latencia y cuota.
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const TOKEN_RENEW_BELOW_MS = TOKEN_TTL_MS / 2;
 
 function scriptCache_() {
   return CacheService.getScriptCache();
@@ -282,37 +289,108 @@ function passwordHash_(password, salt) {
   return h;
 }
 
+// Epoch ms desde un valor de celda: número (expira), Date, o string ISO de
+// isoAhora_(). 0 si no se puede interpretar.
+function epochMsToken_(v) {
+  if (v == null || v === '') return 0;
+  if (typeof v === 'number') return v > 0 ? v : 0;
+  if (v instanceof Date) return v.getTime();
+  const s = String(v).trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(s);
+  if (!m) return 0;
+  try {
+    return Utilities.newDate(Number(m[1]), Number(m[2]), Number(m[3]),
+      Number(m[4]), Number(m[5]), Number(m[6])).getTime();
+  } catch (e) {
+    return 0;
+  }
+}
+
+// Vida de un token: columna expira; filas legacy sin expira se gradúan con
+// fecha_creacion + TTL (si es legible) o se tratan como recién creadas.
+function tokenExpiraMs_(fila, ahora) {
+  const e = epochMsToken_(fila && fila.expira);
+  if (e) return e;
+  const c = epochMsToken_(fila && fila.fecha_creacion);
+  return (c || ahora) + TOKEN_TTL_MS;
+}
+
+function filtrarTokensVigentes_(filas, ahora) {
+  return (filas || []).filter(r => {
+    const e = tokenExpiraMs_(r, ahora);
+    return ahora < e;
+  });
+}
+
 function crearTokenSesion_(username) {
   const token = Utilities.getUuid();
   const usernameNorm = String(username || '').trim();
-  const filas = leerAuthHojaGenerica_('Tokens');
-  filas.push({ token: token, username: usernameNorm, fecha_creacion: isoAhora_() });
+  const ahora = Date.now();
+  const expira = ahora + TOKEN_TTL_MS;
+  // Purga gratis: la reescritura completa ya ocurre aquí, así que se
+  // descartan en la misma pasada los tokens vencidos acumulados.
+  const filas = filtrarTokensVigentes_(leerAuthHojaGenerica_('Tokens'), ahora);
+  filas.push({ token: token, username: usernameNorm, fecha_creacion: isoAhora_(), expira: expira });
   escribirAuthHojaGenerica_('Tokens', filas);
   // Poblar caché de token de inmediato para la siguiente request.
-  if (usernameNorm) cachePutJson_(tokenCacheKey_(token), { u: usernameNorm }, CACHE_TTL_TOKEN_SEC);
+  if (usernameNorm) cachePutJson_(tokenCacheKey_(token), { u: usernameNorm, e: expira }, CACHE_TTL_TOKEN_SEC);
   return token;
 }
 
 function validarTokenSesion_(token) {
   const t = String(token || '').trim();
   if (!t) return '';
+  const ahora = Date.now();
   // 1) Caché Script: evita abrir el master spreadsheet en casi todas las requests.
   const hit = cacheGetJson_(tokenCacheKey_(t));
-  if (hit && hit.u) return String(hit.u);
+  if (hit && hit.u) {
+    if (!hit.e || ahora < hit.e) return String(hit.u);
+    // Vencido según la caché: eliminarla y revalidar contra la hoja (fuente
+    // de verdad; otra ejecución pudo renovarla o purgarla).
+    cacheRemove_(tokenCacheKey_(t));
+  }
   // 2) Fallback a hoja Tokens (con caché de hoja + memoria de request).
-  const fila = leerAuthHojaGenerica_('Tokens').find(r => String(r.token || '') === t);
-  const username = fila ? String(fila.username || '').trim() : '';
-  if (username) cachePutJson_(tokenCacheKey_(t), { u: username }, CACHE_TTL_TOKEN_SEC);
+  const filas = leerAuthHojaGenerica_('Tokens');
+  const fila = filas.find(r => String(r.token || '') === t);
+  if (!fila) return '';
+  const expiraMs = tokenExpiraMs_(fila, ahora);
+  if (ahora >= expiraMs) {
+    // Vencido: se purga aquí mismo (además del resto de vencidos, misma escritura).
+    escribirAuthHojaGenerica_('Tokens',
+      filtrarTokensVigentes_(filas.filter(r => String(r.token || '') !== t), ahora));
+    return '';
+  }
+  const username = String(fila.username || '').trim();
+  let expiraFinal = expiraMs;
+  // Renovación deslizante + migración legacy: solo escribe cuando toca
+  // (queda menos de media vida o falta la columna expira), nunca en steady state.
+  const expiraEsNumero = typeof fila.expira === 'number' && isFinite(fila.expira);
+  if (!expiraEsNumero || expiraMs - ahora < TOKEN_RENEW_BELOW_MS) {
+    expiraFinal = ahora + TOKEN_TTL_MS;
+    escribirAuthHojaGenerica_('Tokens', filas.map(r =>
+      String(r.token || '') === t ? Object.assign({}, r, { expira: expiraFinal }) : r
+    ));
+  }
+  if (username) {
+    const ttlRestante = Math.floor((expiraFinal - ahora) / 1000);
+    cachePutJson_(tokenCacheKey_(t), { u: username, e: expiraFinal },
+      Math.max(0, Math.min(CACHE_TTL_TOKEN_SEC, ttlRestante)));
+  }
   return username;
 }
 
 function invalidarTokenSesion_(token) {
   const t = String(token || '').trim();
   if (!t) return;
+  const ahora = Date.now();
   // Invalidar antes de escribir para que un request concurrente no rehidrate
   // un token ya revocado desde la hoja vieja en caché.
   cacheRemove_(tokenCacheKey_(t));
-  escribirAuthHojaGenerica_('Tokens', leerAuthHojaGenerica_('Tokens').filter(r => String(r.token || '') !== t));
+  // Aprovechar la reescritura para compactar también los vencidos.
+  escribirAuthHojaGenerica_('Tokens',
+    filtrarTokensVigentes_(
+      leerAuthHojaGenerica_('Tokens').filter(r => String(r.token || '') !== t), ahora));
 }
 
 function asegurarUsuarios_() {
@@ -4675,6 +4753,7 @@ function __selfTestHojasBody_() {
   const snapSpreads = leerSpreadsheets_();
   const snapLinks = leerHojasUsuarios_();
   const snapUsers = leerUsuariosAuth_();
+  const snapTokens = leerAuthHojaGenerica_('Tokens');
 
   try {
     const tag = Utilities.getUuid().replace(/-/g, '').slice(0, 12);
@@ -4780,11 +4859,39 @@ function __selfTestHojasBody_() {
       throw new Error('Debió rechazar hoja no vinculada: ' + mensajeError);
     }
 
-    return 'ok — 9 casos de routing de hojas validados';
+    // 10. Ciclo de vida de tokens: expiración, purga al validar y login, e invalidación.
+    const ahoraMs = Date.now();
+    if (tokenExpiraMs_({ fecha_creacion: '2000-01-01T00:00:00' }, ahoraMs) > ahoraMs) {
+      throw new Error('Legacy antiguo sin expira debe considerarse vencido');
+    }
+    if (tokenExpiraMs_({ expira: ahoraMs + TOKEN_TTL_MS }, ahoraMs) <= ahoraMs) {
+      throw new Error('tokenExpiraMs_ debe respetar la columna expira');
+    }
+    const tokVencido = 'selftest-' + Utilities.getUuid();
+    const tokVigente = 'selftest-' + Utilities.getUuid();
+    escribirAuthHojaGenerica_('Tokens', [
+      { token: tokVencido, username: fakeUser, fecha_creacion: isoAhora_(), expira: ahoraMs - 1000 },
+      { token: tokVigente, username: fakeUser, fecha_creacion: isoAhora_(), expira: ahoraMs + TOKEN_TTL_MS }
+    ]);
+    if (validarTokenSesion_(tokVencido) !== '') throw new Error('Token vencido debe rechazarse');
+    if (leerAuthHojaGenerica_('Tokens').some(r => String(r.token) === tokVencido)) {
+      throw new Error('Validar un vencido debe purgarlo de la hoja');
+    }
+    if (validarTokenSesion_(tokVigente) !== fakeUser) throw new Error('Token vigente debe validarse');
+    const tokNuevo = crearTokenSesion_(fakeUser);
+    if (validarTokenSesion_(tokNuevo) !== fakeUser) throw new Error('Token recién creado debe validar al instante');
+    invalidarTokenSesion_(tokNuevo);
+    if (validarTokenSesion_(tokNuevo) !== '') throw new Error('Token invalidado no debe validar');
+    cacheRemove_(tokenCacheKey_(tokVencido));
+    cacheRemove_(tokenCacheKey_(tokVigente));
+    cacheRemove_(tokenCacheKey_(tokNuevo));
+
+    return 'ok — 10 casos de routing de hojas y tokens validados';
   } finally {
     escribirSpreadsheets_(snapSpreads);
     escribirHojasUsuarios_(snapLinks);
     escribirUsuariosAuth_(snapUsers);
+    escribirAuthHojaGenerica_('Tokens', snapTokens);
     _currentSheetId = '';
   }
 }

@@ -34,7 +34,7 @@ clasp push
 1. **Hoja maestra**: crear un Google Sheet con las pestañas `Usuarios`, `Spreadsheets`, `HojasUsuarios`, `Tokens`, `Config` (encabezados en la primera fila). Es la fuente de verdad de auth.
 2. **Vincular la hoja al script**: en Apps Script editor → *Project Settings* → *Script Properties*, o desde código con `PropertiesService`.
 3. **Hojas de datos**: cada usuario/rol se asocia a una hoja de datos vía `HojasUsuarios` (ver `_authadmin` en `code.js:116`). Los endpoints de datos usan `ssActiva_()`, nunca `ss_()` directo.
-5. **Tokens**: la hoja `Tokens` valida cada request. El helper `_currentToken` cachea por-request.
+5. **Tokens**: la hoja `Tokens` valida cada request. `_currentToken` cachea por-request (en `CacheService`, 30 min). Cada fila lleva `expira` (epoch ms); los tokens sin uso caducan a los 30 días. La hoja se compacta en cada login y al validar/expulsar: la reescritura completa ya hace ese pase, así no crece sin límite ni gasta cuota de Sheets.
 6. **Sin hojas**: usuarios sin `HojasUsuarios` devuelven `{sin_hojas: true, sin_datos_financieros: true}` (ver `ALWAYS_ALLOWED_FOR_NO_HOJAS` en `code.js:103`). No se filtran datos de producción.
 
 ## Despliegue
