@@ -93,6 +93,8 @@ function getMasterSpreadsheetId_() {
 const CACHE_TTL_TOKEN_SEC = 30 * 60;       // 30 min — validación de sesión
 const CACHE_TTL_AUTH_SHEET_SEC = 5 * 60;   // 5 min — hojas del spreadsheet maestro
 const CACHE_TTL_SALDOS_SEC = 10 * 60;      // 10 min — saldos/evolución de cuentas
+const CACHE_TTL_DATA_VERSION_SEC = 6 * 60 * 60; // 6 h — data_version por hoja de datos
+const CACHE_TTL_SCHEMA_SEC = 6 * 60 * 60;  // 6 h — esquema ya migrado por hoja/versión
 const CACHE_MAX_JSON_CHARS = 90000;        // margen bajo el límite ~100 KB
 
 // Tokens de sesión: caducan a los 30 días sin uso (renovación deslizante al
@@ -338,9 +340,21 @@ function crearTokenSesion_(username) {
   return token;
 }
 
+// Resultado de validarTokenSesion_ memoizado durante la request: currentUser_()
+// se llama decenas de veces (filas, owner, saldosCacheKey_...) y cada una
+// golpeaba CacheService (descompresión + JSON.parse).
+const _tokenUserMem = {};
+
 function validarTokenSesion_(token) {
   const t = String(token || '').trim();
   if (!t) return '';
+  if (_tokenUserMem[t]) return _tokenUserMem[t];
+  const usuario = validarTokenSesionSinMemo_(t);
+  if (usuario) _tokenUserMem[t] = usuario;
+  return usuario;
+}
+
+function validarTokenSesionSinMemo_(t) {
   const ahora = Date.now();
   // 1) Caché Script: evita abrir el master spreadsheet en casi todas las requests.
   const hit = cacheGetJson_(tokenCacheKey_(t));
@@ -383,6 +397,7 @@ function validarTokenSesion_(token) {
 function invalidarTokenSesion_(token) {
   const t = String(token || '').trim();
   if (!t) return;
+  delete _tokenUserMem[t];
   const ahora = Date.now();
   // Invalidar antes de escribir para que un request concurrente no rehidrate
   // un token ya revocado desde la hoja vieja en caché.
@@ -613,10 +628,18 @@ function guardarAuthSheetIdParaEntorno_(sheetId) {
   return id;
 }
 
+// openById cuesta decenas de ms por llamada y se invocaba decenas de veces por
+// request (asegurarHoja, leerHoja, upsertFila...). Se memoiza por id.
+const _ssHandleCache = {};
+function openSsCached_(id) {
+  if (!_ssHandleCache[id]) _ssHandleCache[id] = SpreadsheetApp.openById(id);
+  return _ssHandleCache[id];
+}
+
 function ss_() {
   const configuredId = obtenerSheetIdConfigurado_();
   if (configuredId) {
-    try { return SpreadsheetApp.openById(configuredId); }
+    try { return openSsCached_(configuredId); }
     catch (e) { /* id inválido, recrear */ }
   }
   // Primera vez (o id corrupto): crear spreadsheet por defecto.
@@ -632,7 +655,7 @@ function ss_() {
 // _authadmin), abre esa; en caso contrario cae al sheet por entorno.
 function ssActiva_() {
   if (_currentSheetId) {
-    try { return SpreadsheetApp.openById(_currentSheetId); }
+    try { return openSsCached_(_currentSheetId); }
     catch (e) { /* id inválido o revocado: fallback */ }
   }
   return ss_();
@@ -641,7 +664,7 @@ function ssActiva_() {
 function authSs_() {
   const id = getMasterSpreadsheetId_();
   if (!id) throw new Error('Configura MASTER_SPREADSHEET_ID en Script Properties');
-  return SpreadsheetApp.openById(id);
+  return openSsCached_(id);
 }
 
 function asegurarAuthHojaUsuarios_() {
@@ -1218,6 +1241,27 @@ function asegurarEsquema() {
   HOJAS.forEach(asegurarHoja);
 }
 
+// Huella del SCHEMA/HOJAS: si el código cambia el esquema, la huella cambia y
+// la migración vuelve a ejecutarse aunque la caché siga viva.
+let _schemaFp = '';
+function schemaFingerprint_() {
+  if (_schemaFp) return _schemaFp;
+  const s = JSON.stringify(SCHEMA) + '|' + JSON.stringify(HOJAS);
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  _schemaFp = h.toString(36);
+  return _schemaFp;
+}
+
+// migrarEsquema lee la cabecera de ~15 hojas; es idempotente y casi siempre
+// no hace nada, así que se salta mientras la marca de caché siga vigente.
+function migrarEsquemaSiHaceFalta_() {
+  const key = 'schema:' + sheetIdParaCache_() + ':' + APP_VERSION + ':' + schemaFingerprint_();
+  try { if (scriptCache_().get(key)) return; } catch (e) { /* ignore */ }
+  migrarEsquema();
+  try { scriptCache_().put(key, '1', CACHE_TTL_SCHEMA_SEC); } catch (e) { /* ignore */ }
+}
+
 // Añade columnas nuevas a hojas existentes sin tocar filas. Idempotente.
 // Renombra la columna legacy a la primera columna de SCHEMA al migrar hojas pobladas.
 function migrarEsquema() {
@@ -1356,18 +1400,50 @@ function escribirMetaValor_(clave, valor) {
 function getDataVersion_(sheetId) {
   const id = String(sheetId || sheetIdParaCache_());
   if (_dataVersionMem[id] != null) return _dataVersionMem[id];
+  // Script Cache: evita abrir/leer la hoja _meta en cada request.
+  try {
+    const c = scriptCache_().get(dataVersionCacheKey_(id));
+    if (c) {
+      _dataVersionMem[id] = c;
+      return c;
+    }
+  } catch (e) { /* ignore */ }
   const v = leerMetaValor_(META_DATA_VERSION_KEY) || '0';
   _dataVersionMem[id] = v;
+  try { scriptCache_().put(dataVersionCacheKey_(id), v, CACHE_TTL_DATA_VERSION_SEC); } catch (e) { /* ignore */ }
   return v;
+}
+
+function dataVersionCacheKey_(id) {
+  return 'dv:' + String(id);
+}
+
+// Las mutaciones suben la versión varias veces por request (p. ej. dos
+// escrituras de Cuentas/Transacciones). Mientras se despacha una request
+// HTTP, la escritura a _meta se difiere y se hace una sola vez al final
+// (flushDataVersion_); la caché de memoria y Script Cache se actualizan ya.
+let _deferDataVersionWrites = false;
+let _dataVersionPending = '';
+
+function flushDataVersion_() {
+  const v = _dataVersionPending;
+  _dataVersionPending = '';
+  if (!v) return;
+  try { escribirMetaValor_(META_DATA_VERSION_KEY, v); } catch (e) { /* best-effort */ }
 }
 
 function bumpDataVersion_(sheetId) {
   const id = String(sheetId || sheetIdParaCache_());
   const v = String(Date.now()) + '-' + String(Math.floor(Math.random() * 1e6));
-  try {
-    escribirMetaValor_(META_DATA_VERSION_KEY, v);
-  } catch (e) { /* best-effort */ }
   _dataVersionMem[id] = v;
+  try { scriptCache_().put(dataVersionCacheKey_(id), v, CACHE_TTL_DATA_VERSION_SEC); } catch (e) { /* ignore */ }
+  if (_deferDataVersionWrites) {
+    _dataVersionPending = v;
+  } else {
+    try {
+      escribirMetaValor_(META_DATA_VERSION_KEY, v);
+    } catch (e) { /* best-effort */ }
+  }
   return v;
 }
 
@@ -1558,6 +1634,7 @@ function ajustarSnapshotsPorCambioTx_(txAnterior, txNuevo) {
   if (!snapshots.length) return;
   const cuentas = leerHoja('Cuentas');
   const defaultSubByParent = {};
+  let huboCambio = false;
 
   const aplicar = (t, signo) => {
     if (!t) return;
@@ -1580,13 +1657,18 @@ function ajustarSnapshotsPorCambioTx_(txAnterior, txNuevo) {
         ? (defaultSubByParent[t.cuenta_id] && defaultSubByParent[t.cuenta_id].id) || ''
         : '';
       const d = deltaScope_(t, snap.scope, snap.scope_id, defaultSubId);
+      if (!d) return;
       snap.saldo = Number((Number(snap.saldo || 0) + signo * d).toFixed(2));
+      huboCambio = true;
     });
   };
 
   aplicar(txAnterior, -1);
   aplicar(txNuevo, +1);
 
+  // Si ningún snapshot varía (tx posterior al último cierre, o neto 0), no se
+  // reescribe la hoja completa.
+  if (!huboCambio) return;
   escribirSnapshots_(snapshots);
 }
 
@@ -1768,8 +1850,21 @@ function upsertFila(nombre, fila) {
 }
 
 function eliminarFila(nombre, id) {
-  const datos = leerHoja(nombre).filter(f => f.id !== id);
-  escribirHoja(nombre, datos);
+  const datos = leerHoja(nombre);
+  const idx = datos.findIndex(f => f.id === id);
+  if (idx < 0) return;
+  // Borrar solo la fila afectada en vez de limpiar y reescribir toda la hoja.
+  // La fila de datos en el sheet es idx + 2 (cabecera en 1).
+  try {
+    const h = ssActiva_().getSheetByName(nombre);
+    if (!h) throw new Error('sin hoja');
+    h.deleteRow(idx + 2);
+    datos.splice(idx, 1);
+    _sheetReadCache[nombre] = cloneRows_(datos);
+    if (nombre === 'Cuentas' || nombre === 'Transacciones') invalidateSaldosCache_();
+  } catch (e) {
+    escribirHoja(nombre, datos.filter(f => f.id !== id));
+  }
 }
 
 function sembrar(owner, seed) {
@@ -1817,6 +1912,7 @@ const API_ACTIONS = new Set([
   'listarSpreadsheetsAdmin', 'altaSpreadsheetAdmin', 'bajaSpreadsheetAdmin', 'resetearSpreadsheetAdmin', 'renombrarSpreadsheetAdmin',
   'listarVinculacionesAdmin', 'vincularHojaUsuarioAdmin', 'desvincularHojaUsuarioAdmin', 'setHojaPorDefectoAdmin',
   'listarMisHojas', 'cambiarHojaActiva', 'obtenerConfigSheets', 'setEntorno', 'setSheetIdEntorno', 'setAuthSheetIdEntorno', 'resetSheet',
+  'sincronizarEstado',
   'obtenerCuentas', 'guardarCuenta', 'eliminarCuenta', 'reordenarSubcuentas', 'reordenarCuentas',
   'obtenerCategorias', 'guardarCategoria', 'eliminarCategoria', 'reordenarCategorias',
   'obtenerEstablecimientos', 'guardarEstablecimiento', 'eliminarEstablecimiento',
@@ -1856,7 +1952,14 @@ function dispatchApi_(request) {
   if (!API_ACTIONS.has(action)) throw new Error('Acción no permitida: ' + action);
   const fn = globalThis[action];
   if (API_PUBLIC_ACTIONS.has(action)) return fn.apply(null, args);
-  return _authadmin(request.token, action, ...args);
+  // La escritura de data_version a _meta se hace una sola vez al final.
+  _deferDataVersionWrites = true;
+  try {
+    return _authadmin(request.token, action, ...args);
+  } finally {
+    _deferDataVersionWrites = false;
+    flushDataVersion_();
+  }
 }
 
 function __selfTestApi_() {
@@ -1900,6 +2003,24 @@ function bootstrap() {
   return base;
 }
 
+// Sincronización incremental por data_version. Si el cliente ya tiene la
+// versión vigente responde solo { sin_cambios: true } (sin leer transacciones
+// ni calcular saldos); si no, devuelve transacciones y cuentas en una sola
+// llamada (antes eran dos: obtenerTransacciones + obtenerCuentas).
+// soloVerificar = true devuelve únicamente la versión (sin datos).
+function sincronizarEstado(versionCliente, soloVerificar) {
+  const version = getDataVersion_();
+  const vCliente = String(versionCliente || '');
+  if (vCliente && vCliente === version) return { sin_cambios: true, data_version: version };
+  if (soloVerificar) return { sin_cambios: false, data_version: version };
+  return {
+    sin_cambios: false,
+    data_version: version,
+    transacciones: obtenerTransacciones({}),
+    cuentas: obtenerCuentas()
+  };
+}
+
 // Bootstrap ligero para carga progresiva en el cliente.
 // Devuelve todo menos transacciones para que la UI pinte antes.
 function bootstrapBase() {
@@ -1937,15 +2058,21 @@ function bootstrapBase() {
   }
 
   _currentSheetId = hojaActivaId;
-  migrarEsquema();
-  let owners = listarOwnersConDatos_();
-  if (!owners.length) {
+  migrarEsquemaSiHaceFalta_();
+  // Comprobación barata primero: si Cuentas ya tiene algún owner, la hoja tiene
+  // datos y no hace falta recorrer las ~15 hojas (listarOwnersConDatos_).
+  if (!leerHoja('Cuentas').some(c => String(c.owner || '').trim()) && !listarOwnersConDatos_().length) {
     sembrar(owner);
-    owners = [owner];
   }
   normalizarCuentasSinSubcuentas_();
   normalizarSubcuentasHuerfanas_();
-  owners.forEach(ownerFila => {
+  // Solo los owners con plantillas activas necesitan generación de recurrentes.
+  const ownersRecurrentes = new Set();
+  leerHoja('Recurrentes').forEach(r => {
+    const o = String(r.owner || '').trim();
+    if (o && r.activa) ownersRecurrentes.add(o);
+  });
+  ownersRecurrentes.forEach(ownerFila => {
     generarRecurrentesPendientes_(ownerFila, new Date());
   });
   return {
@@ -3128,9 +3255,12 @@ function upsertRecurrenteBase_(owner, tx) {
 function generarRecurrentesPendientes_(owner, fechaCorte) {
   const actor = currentUser_() || owner;
   const recs = leerHoja('Recurrentes').filter(r => r.owner === owner && r.activa);
+  // Sin plantillas activas no hay nada que generar ni escribir.
+  if (!recs.length) return;
   const txs = leerHoja('Transacciones');
   const cuentasHoja = leerHoja('Cuentas');
   let cambios = false;
+  let recsCambiadas = false;
   recs.forEach(r => {
     try {
       const p = JSON.parse(r.plantilla);
@@ -3206,18 +3336,24 @@ function generarRecurrentesPendientes_(owner, fechaCorte) {
         }
         cursor = siguienteCursor_(cursor, periodo, dia);
       }
+      const ultimaPrevia = String(r.ultima_generacion || '');
       r.ultima_generacion = iso_(corte);
+      if (String(r.ultima_generacion) !== ultimaPrevia) recsCambiadas = true;
     } catch (e) {
       // ponytail: plantilla corrupta no debe romper el bootstrap
       Logger.log('plantilla corrupta ' + r.id + ': ' + e.message);
     }
   });
   if (cambios) escribirHoja('Transacciones', txs);
-  escribirHoja('Recurrentes', leerHoja('Recurrentes').map(r => {
-    if (r.owner !== owner) return r;
-    const nuevo = recs.find(x => x.id === r.id);
-    return nuevo || r;
-  }));
+  // Reescribir Recurrentes solo si algún ultima_generacion cambió (antes se
+  // reescribía la hoja completa en cada bootstrap aunque nada variara).
+  if (recsCambiadas) {
+    escribirHoja('Recurrentes', leerHoja('Recurrentes').map(r => {
+      if (r.owner !== owner) return r;
+      const nuevo = recs.find(x => x.id === r.id);
+      return nuevo || r;
+    }));
+  }
 }
 
 // ponytail: dedup al generar recurrentes. Idempotente por (recurrente_id, mes)
@@ -3372,7 +3508,14 @@ function obtenerResumen(anio, mes) {
   // último parsea en UTC y, para txs del día 1, podía caer en el mes anterior en
   // zonas horarias negativas, desalineando el KPI del top-level respecto al evol.
   const periodo = Number(a) + '-' + String(m).padStart(2, '0');
-  const enMes = txs.filter(t => String(t.fecha).slice(0, 7) === periodo);
+  // Agrupar por mes una sola vez: evita recorrer todas las txs ~14 veces
+  // (mes actual + 12 meses de evolución) por cada render.
+  const txsPorMes = {};
+  txs.forEach(t => {
+    const k = String(t.fecha).slice(0, 7);
+    (txsPorMes[k] || (txsPorMes[k] = [])).push(t);
+  });
+  const enMes = txsPorMes[periodo] || [];
   const ingresos = enMes.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + impDef(t), 0);
   const gastos = enMes.filter(t => t.tipo === 'gasto').reduce((s, t) => s + impDef(t), 0);
   // ponytail: devoluciones restan del total de gastos del mes (revierte gastos).
@@ -3392,7 +3535,7 @@ function obtenerResumen(anio, mes) {
     // ponytail: usa componentes locales (script tz) — formatDate con ss_tz podía devolver
     // el mes anterior si la hoja estaba en UTC; los slice(0,7) de txs almacenados no matcheaban
     const k = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
-    const en = txs.filter(t => String(t.fecha).slice(0, 7) === k);
+    const en = txsPorMes[k] || [];
     // ponytail: gastos/ingresos = flujo real (gasto − devolución). Los *Presupuesto
     // añaden las transferencias que la sección Presupuesto cuenta como gasto/ingreso,
     // para que el gráfico de Evolución cuadre con esas tarjetas en todos los meses.
