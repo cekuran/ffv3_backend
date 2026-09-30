@@ -1916,7 +1916,7 @@ const API_ACTIONS = new Set([
   'obtenerCuentas', 'guardarCuenta', 'eliminarCuenta', 'reordenarSubcuentas', 'reordenarCuentas',
   'obtenerCategorias', 'guardarCategoria', 'eliminarCategoria', 'reordenarCategorias',
   'obtenerEstablecimientos', 'guardarEstablecimiento', 'eliminarEstablecimiento',
-  'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion',
+  'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion', 'guardarTransaccionesLote',
   'obtenerRecurrentes', 'guardarRecurrente', 'eliminarRecurrente', 'generarRecurrentesPendientes',
   'obtenerPresupuestos', 'guardarPresupuesto', 'eliminarPresupuesto', 'conciliar', 'obtenerConciliaciones', 'editarConciliacion', 'eliminarConciliacion',
   'obtenerResumen', 'obtenerReporteMensual', 'obtenerResumenEstablecimientos', 'obtenerCategoriasResumen', 'guardarTipoCambio', 'eliminarTipoCambio', 'obtenerTiposCambio',
@@ -3045,6 +3045,66 @@ function eliminarTransaccion(id, baseFechaUltimaEdicion) {
   // representando el estado correcto sin la tx eliminada.
   ajustarSnapshotsPorCambioTx_(existente, null);
   return { ok: true, data_version: getDataVersion_() };
+}
+
+// ponytail: edición en lote. Aplica los mismos `cambios` a cada tx de `ids`
+// reutilizando guardarTransaccion (validaciones, snapshots, importe_en_defecto).
+// Sólo campos presentes en `cambios` se modifican; ''  en categoria_id /
+// establecimiento_id / descripcion / notas los limpia. Los fallos se reportan
+// por tx sin abortar el resto.
+function guardarTransaccionesLote(ids, cambios) {
+  requireUsuario_();
+  if (!Array.isArray(ids) || !ids.length) throw new Error('Selecciona al menos una transacción');
+  if (ids.length > 200) throw new Error('Máximo 200 transacciones por lote');
+  const c = cambios || {};
+  const CAMPOS = ['categoria_id', 'establecimiento_id', 'estado', 'fecha', 'descripcion', 'notas'];
+  const aplicar = CAMPOS.filter(k => c[k] !== undefined && c[k] !== null);
+  if (!aplicar.length) throw new Error('No hay cambios que aplicar');
+  if (aplicar.includes('estado') && !['pendiente', 'pagado', 'vencido', 'conciliado'].includes(c.estado)) {
+    throw new Error('Estado inválido');
+  }
+  if (aplicar.includes('fecha') && !parseFecha(c.fecha)) throw new Error('Fecha inválida');
+  const catsById = {};
+  if (aplicar.includes('categoria_id') && c.categoria_id) {
+    leerHoja('Categorias').forEach(x => { catsById[x.id] = x; });
+    if (!catsById[c.categoria_id]) throw new Error('Categoría no encontrada');
+  }
+  const porId = {};
+  leerHoja('Transacciones').forEach(t => { porId[t.id] = t; });
+  const actualizadas = [];
+  const errores = [];
+  const vistos = new Set();
+  ids.forEach(id => {
+    if (vistos.has(id)) return;
+    vistos.add(id);
+    const existente = porId[id];
+    if (!existente) { errores.push({ id: id, error: 'Transacción no encontrada' }); return; }
+    try {
+      const reparto = parseRepartoDestino_(existente.reparto_destino);
+      const tx = Object.assign({}, existente, { reparto_destino: reparto });
+      aplicar.forEach(k => {
+        if (k === 'establecimiento_id' && existente.tipo === 'transferencia') return;
+        tx[k] = c[k];
+      });
+      if (aplicar.includes('categoria_id')) {
+        if (existente.tipo === 'transferencia' && reparto.length) {
+          throw new Error('Transferencia con reparto: edita su categoría individualmente');
+        }
+        const esperado = existente.tipo === 'devolucion' ? 'gasto' : existente.tipo;
+        if (c.categoria_id && existente.tipo !== 'transferencia' && catsById[c.categoria_id].tipo !== esperado) {
+          throw new Error('La categoría debe ser de tipo ' + esperado);
+        }
+        if (!c.categoria_id && existente.tipo === 'devolucion') {
+          throw new Error('Categoría de devolución obligatoria');
+        }
+      }
+      const res = guardarTransaccion(tx);
+      actualizadas.push(res.transaccion);
+    } catch (err) {
+      errores.push({ id: id, error: String(err && err.message || err) });
+    }
+  });
+  return { actualizadas: actualizadas, errores: errores, data_version: getDataVersion_() };
 }
 
 // ───────── Recurrentes ─────────
