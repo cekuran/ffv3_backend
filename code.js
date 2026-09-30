@@ -3578,6 +3578,20 @@ function obtenerResumen(anio, mes) {
     running += netByMonth[allMonths[i]];
   }
   evol.forEach(e => { e.balance = currentBalance - (futureNet[e.mes] || 0); });
+  // ponytail: saldo real al cierre de cada mes desde cuenta.evolucion (incluye transferencias);
+  // la resta de flujos solo es respaldo si alguna cuenta no trae ese mes.
+  const cuentasEvol = obtenerCuentas().filter(c => c.tipo === 'activo' || c.tipo === 'pasivo');
+  if (cuentasEvol.length) {
+    evol.forEach(e => {
+      let suma = 0;
+      for (let j = 0; j < cuentasEvol.length; j++) {
+        const ev = (cuentasEvol[j].evolucion || []).find(x => x.mes === e.mes);
+        if (!ev) return;
+        suma += Number(ev.saldo || 0);
+      }
+      e.balance = suma;
+    });
+  }
   // Próximos recurrentes
   const recs = filasVisibles_('Recurrentes').filter(r => r.activa);
   const proximos = recs.map(r => {
