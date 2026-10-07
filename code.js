@@ -1705,7 +1705,7 @@ function cloneCuentasComputed_(data) {
 // Subcuenta: [id, nombre, parent_id, saldo_inicial, saldo, orden]
 function packSaldosCache_(cuentas) {
   return {
-    v: 1,
+    v: 2,
     c: (cuentas || []).map(function (cta) {
       return [
         cta.id,
@@ -1735,7 +1735,7 @@ function packSaldosCache_(cuentas) {
 }
 
 function unpackSaldosCache_(packed) {
-  if (!packed || packed.v !== 1 || !Array.isArray(packed.c)) return null;
+  if (!packed || packed.v !== 2 || !Array.isArray(packed.c)) return null;
   return packed.c.map(function (r) {
     return {
       id: r[0],
@@ -2188,46 +2188,48 @@ function obtenerCuentas() {
     const cuentaSaldo = subcuentas.reduce((s, x) => s + x.saldo, 0);
     const cuentaSaldoInicial = subcuentas.reduce((s, x) => s + x.saldo_inicial, 0);
 
+    // ponytail: evolución de los últimos 6 meses (cierre de cada mes). Saldo de una
+    // subcuenta al cierre de un mes = snapshot de ese cierre si existe; si no,
+    // se parte del anchor (mes posterior al anchor) o del saldo inicial (mes
+    // anterior/sin snapshot) y se suman los deltas de las txs hasta ese día.
+    // El mes en curso termina exactamente en el saldo actual de la cuenta.
     const hoy = new Date();
+    const mesActualKey = fmtMes(hoy);
     const evolucion = [];
-    for (let i = 11; i >= 0; i--) {
+    for (let i = 5; i >= 0; i--) {
       const d = new Date(hoy.getFullYear(), hoy.getMonth() - i, 1);
       const k = fmtMes(d);
-      const lastDayK = iso_(new Date(d.getFullYear(), d.getMonth() + 1, 0));
-      const todasLasSubsTienenSnapK = subs.every(x => snapByKey[lastDayK + '|subcuenta:' + x.id] != null);
-      if (todasLasSubsTienenSnapK) {
-        // Mes cerrado: suma directa de los snapshots de las subcuentas.
-        let subSnapTotalK = 0;
-        subs.forEach(x => {
-          subSnapTotalK += snapByKey[lastDayK + '|subcuenta:' + x.id];
-        });
-        evolucion.push({ mes: k, saldo: subSnapTotalK });
-      } else {
-        // Mes en curso o subcuentas aún sin snapshot: anchor (suma snaps_sub)
-        // + deltas live de subcuentas hasta lastDayK.
-        let anchorSubTotal = 0;
-        subs.forEach(x => {
-          const a = snapByKey[anchorFechaFin + '|subcuenta:' + x.id];
-          anchorSubTotal += (a != null ? a : Number(x.saldo_inicial || 0));
-        });
-        const subDeltaK = subcuentas.reduce((s, sub) => {
-          const base = snapByKey[anchorFechaFin + '|subcuenta:' + sub.id];
-          const baseVal = base != null ? base : Number(sub.saldo_inicial || 0);
-          const live = liveTxs
-            .filter(t => {
-              if (String(t.fecha) > lastDayK) return false;
-              if ((t.subcuenta_id || defaultSubId) === sub.id && t.cuenta_id === c.id) return true;
-              if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
-              const reparto = parseRepartoDestino_(t.reparto_destino);
-              if (reparto.length) return reparto.some(r => r.subcuenta_id === sub.id);
-              return t.subcuenta_destino_id === sub.id;
-            })
-            .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id, defaultSubId), 0);
-          // delta respecto al inicial: lo que se mueve esta sub en (anchor, lastDayK].
-          return s + (baseVal + live - Number(sub.saldo_inicial || 0));
-        }, 0);
-        evolucion.push({ mes: k, saldo: anchorSubTotal + subDeltaK });
+      if (k === mesActualKey) {
+        evolucion.push({ mes: k, saldo: cuentaSaldo });
+        continue;
       }
+      const lastDayK = iso_(new Date(d.getFullYear(), d.getMonth() + 1, 0));
+      let totalK = 0;
+      subs.forEach(sub => {
+        const snapK = snapByKey[lastDayK + '|subcuenta:' + sub.id];
+        if (snapK != null) { totalK += snapK; return; }
+        const subInitial = Number(sub.saldo_inicial || 0);
+        const snapAnchor = anchorFechaFin ? snapByKey[anchorFechaFin + '|subcuenta:' + sub.id] : null;
+        let base, desde;
+        if (snapAnchor != null && anchorFechaFin < lastDayK) {
+          base = snapAnchor; desde = anchorFechaFin;
+        } else {
+          base = subInitial; desde = '';
+        }
+        const delta = txs
+          .filter(t => {
+            const f = String(t.fecha);
+            if (f > lastDayK || (desde && f <= desde)) return false;
+            if ((t.subcuenta_id || defaultSubId) === sub.id && t.cuenta_id === c.id) return true;
+            if (t.cuenta_destino_id !== c.id || (t.tipo !== 'transferencia' && t.tipo !== 'devolucion')) return false;
+            const reparto = parseRepartoDestino_(t.reparto_destino);
+            if (reparto.length) return reparto.some(r => r.subcuenta_id === sub.id);
+            return t.subcuenta_destino_id === sub.id;
+          })
+          .reduce((sd, t) => sd + deltaSubcuenta_(t, sub.id, defaultSubId), 0);
+        totalK += base + delta;
+      });
+      evolucion.push({ mes: k, saldo: Number(totalK.toFixed(2)) });
     }
 
     return {
