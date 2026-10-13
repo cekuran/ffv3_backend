@@ -3,7 +3,7 @@
 // Multi-usuario: cada fila conserva owner como metadato; el CRUD usa el id global.
 
 const SCHEMA = {
-  Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','establecimiento_id','fecha_creacion'],
+  Cuentas:       ['owner','id','parent_id','nombre','tipo','moneda','icono','saldo_inicial','orden','oculta','establecimiento_id','fecha_creacion','archivada'],
   Categorias:    ['owner','id','nombre','color','icono','tipo','orden'],
   Establecimientos:['owner','id','nombre','web'],
   Transacciones: ['owner','id','fecha','tipo','importe','moneda','importe_en_defecto','cuenta_id','subcuenta_id','cuenta_destino_id','subcuenta_destino_id','importe_destino','ratio_conversion','reparto_destino','categoria_id','descripcion','estado','recurrente_id','fecha_pago','conciliada_con','notas','fecha_creacion','ultima_edicion_por','fecha_ultima_edicion','establecimiento_id','viaje_id'],
@@ -1700,12 +1700,16 @@ function cloneCuentasComputed_(data) {
 
 // Formato compacto v1 para Script Cache: arrays posicionales (menos claves
 // repetidas → JSON más pequeño y mejor ratio gzip).
-// Cuenta:  [id, nombre, tipo, moneda, icono, saldo_inicial, saldo, evolucion[], subcuentas[], establecimiento_id]
+// Cuenta:  [id, nombre, tipo, moneda, icono, saldo_inicial, saldo, evolucion[], subcuentas[], establecimiento_id, archivada]
 // Evolución: [mes, saldo]
-// Subcuenta: [id, nombre, parent_id, saldo_inicial, saldo, orden]
+// Subcuenta: [id, nombre, parent_id, saldo_inicial, saldo, orden, archivada]
+function esArchivada_(v) {
+  return v === true || String(v).toLowerCase() === 'true';
+}
+
 function packSaldosCache_(cuentas) {
   return {
-    v: 2,
+    v: 3,
     c: (cuentas || []).map(function (cta) {
       return [
         cta.id,
@@ -1725,17 +1729,19 @@ function packSaldosCache_(cuentas) {
             s.parent_id || '',
             Number(s.saldo_inicial || 0),
             Number(s.saldo || 0),
-            Number(s.orden || 99)
+            Number(s.orden || 99),
+            s.archivada ? 1 : 0
           ];
         }),
-        cta.establecimiento_id || ''
+        cta.establecimiento_id || '',
+        cta.archivada ? 1 : 0
       ];
     })
   };
 }
 
 function unpackSaldosCache_(packed) {
-  if (!packed || packed.v !== 2 || !Array.isArray(packed.c)) return null;
+  if (!packed || packed.v !== 3 || !Array.isArray(packed.c)) return null;
   return packed.c.map(function (r) {
     return {
       id: r[0],
@@ -1755,10 +1761,12 @@ function unpackSaldosCache_(packed) {
           parent_id: s[2] || '',
           saldo_inicial: Number(s[3] || 0),
           saldo: Number(s[4] || 0),
-          orden: Number(s[5] || 99)
+          orden: Number(s[5] || 99),
+          archivada: !!s[6]
         };
       }),
-      establecimiento_id: r[9] || ''
+      establecimiento_id: r[9] || '',
+      archivada: !!r[10]
     };
   });
 }
@@ -1913,7 +1921,7 @@ const API_ACTIONS = new Set([
   'listarVinculacionesAdmin', 'vincularHojaUsuarioAdmin', 'desvincularHojaUsuarioAdmin', 'setHojaPorDefectoAdmin',
   'listarMisHojas', 'cambiarHojaActiva', 'obtenerConfigSheets', 'setEntorno', 'setSheetIdEntorno', 'setAuthSheetIdEntorno', 'resetSheet',
   'sincronizarEstado',
-  'obtenerCuentas', 'guardarCuenta', 'eliminarCuenta', 'reordenarSubcuentas', 'reordenarCuentas',
+  'obtenerCuentas', 'guardarCuenta', 'eliminarCuenta', 'archivarCuenta', 'reordenarSubcuentas', 'reordenarCuentas',
   'obtenerCategorias', 'guardarCategoria', 'eliminarCategoria', 'reordenarCategorias',
   'obtenerEstablecimientos', 'guardarEstablecimiento', 'eliminarEstablecimiento',
   'obtenerTransacciones', 'guardarTransaccion', 'eliminarTransaccion', 'guardarTransaccionesLote',
@@ -2181,7 +2189,8 @@ function obtenerCuentas() {
         id: s.id, nombre: s.nombre, parent_id: c.id,
         saldo_inicial: subInitial,
         saldo: anchorSubSaldo + subDelta,
-        orden: Number(s.orden || 99)
+        orden: Number(s.orden || 99),
+        archivada: esArchivada_(s.archivada)
       };
     }).sort((a, b) => a.orden - b.orden);
 
@@ -2234,6 +2243,7 @@ function obtenerCuentas() {
 
     return {
       id: c.id, nombre: c.nombre, tipo: c.tipo, moneda: c.moneda, icono: c.icono, establecimiento_id: c.establecimiento_id || '',
+      archivada: esArchivada_(c.archivada),
       saldo_inicial: cuentaSaldoInicial,
       saldo: cuentaSaldo,
       evolucion,
@@ -2425,10 +2435,20 @@ function guardarCuenta(cuenta) {
     orden: cuenta.orden || (existente && existente.orden) || 99,
     oculta: !!cuenta.oculta,
     establecimiento_id: estId,
-    fecha_creacion: (existente && existente.fecha_creacion) || isoAhora_()
+    fecha_creacion: (existente && existente.fecha_creacion) || isoAhora_(),
+    archivada: existente ? esArchivada_(existente.archivada) : false
   };
   upsertFila('Cuentas', fila);
   if (!fila.parent_id) asegurarSubcuentaDefaultCuenta_(fila.id);
+  return obtenerCuentas();
+}
+
+// Archiva o restaura una cuenta o subcuenta. No borra datos ni movimientos;
+// las archivadas se siguen devolviendo con archivada=true para poder mostrarlas.
+function archivarCuenta(id, archivada) {
+  const cuenta = leerHoja('Cuentas').find(c => c.id === id);
+  if (!cuenta) throw new Error('Cuenta no encontrada');
+  upsertFila('Cuentas', Object.assign({}, cuenta, { archivada: !!archivada }));
   return obtenerCuentas();
 }
 
